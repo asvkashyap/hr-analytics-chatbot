@@ -1,0 +1,16 @@
+.env
+__pycache__/
+*.pyc
+*.pyo
+.conda/
+chroma_db/
+logs/
+claude_responses/
+taxonomy_results/
+node_modules/
+dist/
+.vite/
+*.csv
+*.json
+!data/raw/mockup_awards.csv
+!output/reports/compressed_taxonomy_with_ids.json
