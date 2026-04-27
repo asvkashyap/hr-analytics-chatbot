@@ -3,7 +3,7 @@ uvicorn[standard]
 python-dotenv==1.2.2
 pyyaml==6.0.3
 pandas==3.0.2
-numpy==2.4.8
+numpy==2.2.6
 scikit-learn
 tqdm==4.67.3
 groq==1.2.0
