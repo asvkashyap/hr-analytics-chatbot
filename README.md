@@ -8,7 +8,7 @@ End-to-end NLP pipeline that classifies 1,000 employee recognition messages into
 
 ## What it does
 ## Demo
-[![Watch the demo](https://img.shields.io/badge/Loom-Watch_Demo-625DF5?style=for-the-badge&logo=loom&logoColor=white)](https://www.loom.com/share/[YOUR_VIDEO_ID](https://www.loom.com/share/04c68b3e16d9421f86810523502f52b3))
+[![Watch the demo](https://img.shields.io/badge/Loom-Watch_Demo-625DF5?style=for-the-badge&logo=loom&logoColor=white)[(https://www.loom.com/share/04c68b3e16d9421f86810523502f52b3)]
 
 **Stage 1 — Taxonomy creation:** Processes raw recognition messages in batches of 20 through a Gemini LLM. Uses grounded theory — no predefined labels. Taxonomy compresses every 5 batches to remove redundancy. Output: 4 categories, 26 subcategories with hierarchical IDs (A, A1, A2...).
 
