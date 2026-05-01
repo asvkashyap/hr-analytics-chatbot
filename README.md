@@ -250,10 +250,4 @@ npm run dev
 
 ---
 
-GEMINI_API_KEY=AIzaSy...
-GEMINI_API_KEY_2=AIzaSy...    # optional: key rotation
-```
-
----
-
 *Northeastern University — MS Data Analytics Engineering · Workhuman Capstone · Spring 2026*
