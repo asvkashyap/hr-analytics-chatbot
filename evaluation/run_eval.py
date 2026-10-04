@@ -28,7 +28,14 @@ OUT_ROOT = Path("output/eval")
 
 # Repeated 3 times to measure run-to-run variation. Covers every group.
 REPEAT_SUBSET = [1, 10, 12, 16, 19, 24, 26, 29, 37, 47]
-WARMUP_QUESTION = "How many recognitions are in each category?"
+# Run before timing starts, not saved. One per tool type, because each loads
+# something on first use: statistics loads the data, search loads the
+# embedding model, and the network question loads the graph.
+WARMUP_QUESTIONS = [
+    "How many recognitions are in each category?",
+    "What kind of messages do engineering teams write?",
+    "Which departments recognize each other most?",
+]
 
 
 def load_cases() -> list[dict]:
@@ -130,8 +137,9 @@ def main() -> None:
     if not (run_dir / "meta.json").exists():
         write_meta(run_dir, args)
 
-    print("Warm-up (not saved): loading models...")
-    chat_agent(WARMUP_QUESTION, session_id=f"eval-{run_id}-warmup")
+    print(f"Warm-up (not saved): loading models with {len(WARMUP_QUESTIONS)} questions...")
+    for i, q in enumerate(WARMUP_QUESTIONS):
+        chat_agent(q, session_id=f"eval-{run_id}-warmup-{i}")
 
     total_cost = 0.0
     start = time.perf_counter()
