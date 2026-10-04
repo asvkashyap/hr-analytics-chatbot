@@ -1,15 +1,14 @@
 """
-src/rag/ragas_eval.py — RAGAS Evaluation for Agentic RAG
+src/rag/ragas_eval.py — RAGAS Evaluation using Groq API
 =========================================================
-Fixed for RAGAS 0.4.3:
-  - Correct dataset column names (user_input, response, retrieved_contexts)
-  - Parallelism disabled to avoid TimeoutErrors on free tier
-  - 15s sleep between answer generation calls
-  - 30s sleep before RAGAS metrics run
+Updated to use Groq (llama-3.3-70b-versatile) for:
+  - Answer generation
+  - RAGAS LLM metrics (faithfulness, answer_relevancy, context_precision)
 
 Run:
     cd "C:\\Users\\kashy\\OneDrive\\Desktop\\Masters Project"
     conda activate masters-project
+    pip install langchain-groq
     python -m src.rag.ragas_eval
 
 Output:
@@ -34,11 +33,11 @@ import pandas as pd
 from datasets import Dataset
 from ragas import evaluate
 from ragas.metrics import faithfulness, answer_relevancy, context_precision
-from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
+from langchain_groq import ChatGroq
 from ragas.llms import LangchainLLMWrapper
 from ragas.embeddings import LangchainEmbeddingsWrapper
-from google import genai as google_genai
-from google.genai import types
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from groq import Groq
 
 from src.rag.tools import vector_search, pandas_analytics
 from src.rag.graph_tool import graph_query
@@ -50,11 +49,12 @@ from src.rag.router import QueryRouter
 
 OUTPUT_DIR    = Path("output/reports")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-SLEEP_BETWEEN = 15
+GROQ_MODEL    = "llama-3.3-70b-versatile"
+SLEEP_BETWEEN = 6    # Groq free tier: 30 req/min, so 6s between calls is safe
 RETRY_SLEEP   = 30
 
 # ---------------------------------------------------------------------------
-# Eval questions — 10 total, one per route type
+# Eval questions — 10 total, covering all route types
 # ---------------------------------------------------------------------------
 
 EVAL_QUESTIONS = [
@@ -93,7 +93,7 @@ def retrieve_context(question: str) -> list[str]:
     return contexts if contexts else ["No context retrieved."]
 
 
-def safe_generate(client, question: str, contexts: list[str], attempt: int = 1) -> str:
+def safe_generate(client: Groq, question: str, contexts: list[str], attempt: int = 1) -> str:
     try:
         context_text = "\n\n".join(contexts)
         prompt = (
@@ -101,14 +101,15 @@ def safe_generate(client, question: str, contexts: list[str], attempt: int = 1) 
             f"---\nQuestion: {question}\n\n"
             f"Answer concisely using the context above."
         )
-        response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=[types.Content(role="user", parts=[types.Part(text=prompt)])],
-            config=types.GenerateContentConfig(temperature=0.1, max_output_tokens=512),
+        response = client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.1,
+            max_tokens=512,
         )
-        return response.text
+        return response.choices[0].message.content
     except Exception as e:
-        if "429" in str(e) and attempt <= 3:
+        if ("429" in str(e) or "rate_limit" in str(e).lower()) and attempt <= 3:
             wait = RETRY_SLEEP * attempt
             print(f"\n      Rate limit — waiting {wait}s (retry {attempt}/3)...")
             time.sleep(wait)
@@ -117,16 +118,16 @@ def safe_generate(client, question: str, contexts: list[str], attempt: int = 1) 
 
 
 # ---------------------------------------------------------------------------
-# Build dataset — RAGAS 0.4.3 column names
+# Build dataset
 # ---------------------------------------------------------------------------
 
-def build_dataset(client) -> Dataset:
+def build_dataset(client: Groq) -> Dataset:
     print(f"\n[2/4] Building dataset ({len(EVAL_QUESTIONS)} questions, {SLEEP_BETWEEN}s sleep between calls)...\n")
 
-    user_inputs         = []
-    responses           = []
-    retrieved_contexts  = []
-    reference           = []
+    user_inputs        = []
+    responses          = []
+    retrieved_contexts = []
+    reference          = []
 
     for i, question in enumerate(EVAL_QUESTIONS):
         print(f"  [{i+1}/{len(EVAL_QUESTIONS)}] {question[:65]}")
@@ -143,12 +144,11 @@ def build_dataset(client) -> Dataset:
 
     print(f"\n  Dataset ready ✓")
 
-    # RAGAS 0.4.3 uses these exact column names
     return Dataset.from_dict({
-        "user_input":          user_inputs,
-        "response":            responses,
-        "retrieved_contexts":  retrieved_contexts,
-        "reference":           reference,
+        "user_input":         user_inputs,
+        "response":           responses,
+        "retrieved_contexts": retrieved_contexts,
+        "reference":          reference,
     })
 
 
@@ -158,29 +158,31 @@ def build_dataset(client) -> Dataset:
 
 def run_evaluation():
     print("=" * 60)
-    print("  RAGAS Evaluation — Agentic RAG Pipeline")
+    print("  RAGAS Evaluation — Groq API (llama-3.3-70b-versatile)")
     print(f"  Questions: {len(EVAL_QUESTIONS)} | Sleep: {SLEEP_BETWEEN}s between calls")
     print("=" * 60)
 
-    api_key = os.getenv("GEMINI_API_KEY")
+    api_key = os.getenv("GROQ_API_KEY")
     if not api_key:
-        raise ValueError("GEMINI_API_KEY not found in .env")
+        raise ValueError("GROQ_API_KEY not found in .env")
 
-    client = google_genai.Client(api_key=api_key)
+    # Groq client for answer generation
+    groq_client = Groq(api_key=api_key)
 
-    # Setup RAGAS evaluator
+    # RAGAS evaluator — Groq LLM + local embeddings (no extra API key needed)
     print("\n[1/4] Setting up RAGAS evaluator...")
-    llm = ChatGoogleGenerativeAI(
-        model="gemini-2.5-flash",
-        google_api_key=api_key,
+    langchain_llm = ChatGroq(
+        model=GROQ_MODEL,
+        groq_api_key=api_key,
         temperature=0,
     )
-    embeddings = GoogleGenerativeAIEmbeddings(
-        model="models/gemini-embedding-001",
-        google_api_key=api_key,
+    # Use local sentence-transformers for embeddings — no API key needed
+    hf_embeddings = HuggingFaceEmbeddings(
+        model_name="all-MiniLM-L6-v2",
+        model_kwargs={"device": "cpu"},
     )
-    ragas_llm        = LangchainLLMWrapper(llm)
-    ragas_embeddings = LangchainEmbeddingsWrapper(embeddings)
+    ragas_llm        = LangchainLLMWrapper(langchain_llm)
+    ragas_embeddings = LangchainEmbeddingsWrapper(hf_embeddings)
 
     for metric in [faithfulness, answer_relevancy, context_precision]:
         metric.llm        = ragas_llm
@@ -189,23 +191,22 @@ def run_evaluation():
     print("  Ready ✓")
 
     # Build dataset
-    dataset = build_dataset(client)
+    dataset = build_dataset(groq_client)
 
-    # Run metrics — disable parallelism to avoid TimeoutErrors
-    print("\n[3/4] Running RAGAS metrics (sleeping 30s to reset rate limits)...")
-    time.sleep(30)
+    # Run metrics
+    print("\n[3/4] Running RAGAS metrics (sleeping 15s to reset rate limits)...")
+    time.sleep(15)
 
     results = evaluate(
-        dataset  = dataset,
-        metrics  = [faithfulness, answer_relevancy, context_precision],
-        is_async = False,   # disable parallelism — prevents TimeoutErrors
-        raise_exceptions = False,
-    )
+    dataset          = dataset,
+    metrics          = [faithfulness, answer_relevancy, context_precision],
+    raise_exceptions = False,
+    ) 
 
     results_df = results.to_pandas()
     print("\nDataFrame columns:", results_df.columns.tolist())
 
-    # Detect correct column names
+    # Detect column names
     q_col = next((c for c in results_df.columns if "input" in c or "question" in c), results_df.columns[0])
     f_col = next((c for c in results_df.columns if "faith" in c), None)
     r_col = next((c for c in results_df.columns if "relev" in c or "relevancy" in c), None)
@@ -219,10 +220,10 @@ def run_evaluation():
     overall = sum(valid) / len(valid) if valid else float("nan")
 
     grade = (
-        "Excellent ✓"      if overall >= 0.8 else
-        "Good"              if overall >= 0.6 else
-        "Fair"              if overall >= 0.4 else
-        "Needs improvement" if str(overall) != "nan" else
+        "Excellent ✓"       if overall >= 0.8 else
+        "Good"               if overall >= 0.6 else
+        "Fair"               if overall >= 0.4 else
+        "Needs improvement"  if str(overall) != "nan" else
         "Could not compute — rate limits affected scoring"
     )
 
@@ -242,7 +243,6 @@ def run_evaluation():
 
     # Per-question table
     print(f"\n  Per-question breakdown:")
-    header_cols = [q_col] + ([f_col] if f_col else []) + ([r_col] if r_col else []) + ([p_col] if p_col else [])
     print(f"  {'Question':<55}", end="")
     if f_col: print(f" {'Faith':>6}", end="")
     if r_col: print(f" {'Relev':>6}", end="")
@@ -262,6 +262,7 @@ def run_evaluation():
     with open(summary_path, "w") as f:
         f.write("RAGAS EVALUATION SUMMARY\n")
         f.write("=" * 40 + "\n\n")
+        f.write(f"Model               : {GROQ_MODEL}\n")
         f.write(f"Questions evaluated : {len(EVAL_QUESTIONS)}\n")
         f.write(f"Route types tested  : Analytical, Semantic, Graph, Hybrid\n\n")
         f.write(f"SCORES:\n")
@@ -277,7 +278,13 @@ def run_evaluation():
     print("  Done! Use ragas_summary.txt for your slides.")
     print("=" * 60)
 
-    return {"faithfulness": f_score, "answer_relevancy": r_score, "context_precision": p_score, "overall": overall, "grade": grade}
+    return {
+        "faithfulness":     f_score,
+        "answer_relevancy": r_score,
+        "context_precision": p_score,
+        "overall":          overall,
+        "grade":            grade,
+    }
 
 
 if __name__ == "__main__":
