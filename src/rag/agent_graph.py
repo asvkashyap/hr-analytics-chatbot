@@ -147,6 +147,9 @@ How to use your tools:
 - Do not state facts about the data that no tool result showed.
 - Report numbers exactly as the tools returned them. Do not calculate new
   percentages, totals, ratios, or differences yourself. A check verifies every number.
+- Text like [PERSON_1], [EMAIL_1], or [PHONE_1] marks a personal detail that was
+  removed for privacy. Never mention, explain, or interpret these placeholders.
+  When quoting a message, leave them out or say "a colleague".
 """
 
 # ---------------------------------------------------------------------------
@@ -163,6 +166,28 @@ _llm = ChatGroq(
 RATE_LIMIT_RETRIES = 4
 _limiter = RateLimiter("groq", GROQ_MODEL)   # this model's own window; limits in config/pricing.yaml
 _wait_by_session: dict[str, float] = {}   # rate-limit waiting, kept apart from processing time
+# Per-step timing: session -> node name -> [seconds, calls]
+_timings_by_session: dict[str, dict[str, list]] = {}
+
+
+def timed(name: str, fn):
+    """Wrap a graph node so every run records how long it took and how often
+    it ran. Rate-limit waiting during the node is subtracted, since it is
+    reported separately and is not the system's own speed."""
+    def wrapper(state: "AgentState", config: RunnableConfig) -> dict:
+        session = config.get("configurable", {}).get("thread_id", "")
+        wait_before = _wait_by_session.get(session, 0.0)
+        start = time.perf_counter()
+        try:
+            return fn(state, config)
+        finally:
+            elapsed = time.perf_counter() - start
+            elapsed -= _wait_by_session.get(session, 0.0) - wait_before
+            entry = _timings_by_session.setdefault(session, {}).setdefault(name, [0.0, 0])
+            entry[0] += elapsed
+            entry[1] += 1
+    wrapper.__name__ = name
+    return wrapper
 
 
 class AgentState(MessagesState):
@@ -371,14 +396,22 @@ def agent_node(state: AgentState, config: RunnableConfig) -> dict:
 
 def build_graph(tools: list | None = None):
     """tools defaults to the real TOOLS; tests pass small fake tools instead.
-    The tool NAMES must match what the LLM calls."""
+    The tool NAMES must match what the LLM calls.
+    Every node is wrapped with timed(), so each run reports per-step timing."""
     tools = tools or TOOLS
+    tool_node = ToolNode(tools)
+
+    def tools_step(state: AgentState, config: RunnableConfig) -> dict:
+        # The prebuilt ToolNode can't be wrapped directly, so call it from a
+        # plain function that timed() can measure
+        return tool_node.invoke(state, config)
+
     g = StateGraph(AgentState)
-    g.add_node("agent", agent_node)
-    g.add_node("tools", ToolNode(tools))
-    g.add_node("input_guard", input_guard)
-    g.add_node("tool_result_guard", tool_result_guard)
-    g.add_node("output_guard", output_guard)
+    g.add_node("agent", timed("agent", agent_node))
+    g.add_node("tools", timed("tools", tools_step))
+    g.add_node("input_guard", timed("input_guard", input_guard))
+    g.add_node("tool_result_guard", timed("tool_result_guard", tool_result_guard))
+    g.add_node("output_guard", timed("output_guard", output_guard))
     # Input guard first: refusals end here, everything else goes to the agent
     g.add_edge(START, "input_guard")
     g.add_conditional_edges("input_guard", route_after_input, {"agent": "agent", END: END})
@@ -415,6 +448,7 @@ def chat_agent(user_input: str, session_id: str = "default") -> dict:
 
     start = time.perf_counter()
     _wait_by_session.pop(session_id, None)
+    _timings_by_session.pop(session_id, None)
     try:
         result = app.invoke(
             {"messages": [("user", user_input)], "guard_revisions": 0, "guard_status": "",
@@ -430,10 +464,12 @@ def chat_agent(user_input: str, session_id: str = "default") -> dict:
             "latency_s":  round(time.perf_counter() - start, 2),
             "wait_s":     round(_wait_by_session.pop(session_id, 0.0), 2),
             "tokens":     {},
+            "timings":    _format_timings(_timings_by_session.pop(session_id, {})),
             "error":      str(e),
         }
     latency = time.perf_counter() - start
     waited = _wait_by_session.pop(session_id, 0.0)
+    timings = _format_timings(_timings_by_session.pop(session_id, {}))
 
     new_msgs = result["messages"][before:]
     trace, tool_calls = [], []
@@ -462,6 +498,10 @@ def chat_agent(user_input: str, session_id: str = "default") -> dict:
         trace.append(f"[GUARD] Tool results withheld as suspected injection: {withheld}")
     trace.append(f"[GUARD] PII redacted: {pii_count} item(s)")
     trace.append(f"[GUARD] Number grounding: {guard}")
+    trace.append("[TIMING] " + " | ".join(
+        f"{node} {t['seconds']:.2f}s" + (f" (x{t['calls']})" if t["calls"] > 1 else "")
+        for node, t in timings.items()
+    ))
 
     answer = new_msgs[-1].content if new_msgs else ""
     cost = cost_usd(GROQ_MODEL, in_tok, out_tok)
@@ -483,7 +523,18 @@ def chat_agent(user_input: str, session_id: str = "default") -> dict:
         "guard":        guard,
         "pii_redacted": pii_count,
         "input_label":  label,
+        "timings":      timings,
+        # Tool outputs the agent actually saw (after injection scan and PII
+        # redaction). The evaluation's RAGAS metrics need these as context.
+        "contexts":     [str(m.content) for m in new_msgs if isinstance(m, ToolMessage)],
     }
+
+
+def _format_timings(raw: dict) -> dict:
+    """{node: [seconds, calls]} -> {node: {"seconds": s, "calls": n}}, in graph order."""
+    order = ["input_guard", "agent", "tools", "tool_result_guard", "output_guard"]
+    nodes = [n for n in order if n in raw] + [n for n in raw if n not in order]
+    return {n: {"seconds": round(raw[n][0], 3), "calls": raw[n][1]} for n in nodes}
 
 
 # ---------------------------------------------------------------------------

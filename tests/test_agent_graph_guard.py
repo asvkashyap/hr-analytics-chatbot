@@ -373,3 +373,21 @@ def test_previous_question_is_passed_for_context(run, monkeypatch):
                         lambda question, previous="": (seen.append(previous) or ("in_scope", "")))
     run([say("First."), say("Second.")], ["Tell me about Engineering", "What about them?"])
     assert seen == ["", "Tell me about Engineering"]
+
+
+# ---------------------------------------------------------------------------
+# Per-step timing
+# ---------------------------------------------------------------------------
+
+def test_chat_agent_reports_per_step_timings(run, monkeypatch):
+    # Uses chat_agent (the real entry point), on a graph with fake tools
+    monkeypatch.setattr(pii, "redact_text", lambda text, mapping, allowlist=None: (text, []))
+    monkeypatch.setattr(ag, "_llm", ScriptedLLM([call("recognition_statistics"), say("There are 442 records.")]))
+    monkeypatch.setattr(ag, "app", ag.build_graph(tools=FAKE_TOOLS))
+
+    result = ag.chat_agent("How many enablement awards?", session_id="timing-test")
+    timings = result["timings"]
+    assert list(timings) == ["input_guard", "agent", "tools", "tool_result_guard", "output_guard"]
+    assert timings["agent"]["calls"] == 2            # tool request, then the answer
+    assert all(t["seconds"] >= 0 for t in timings.values())
+    assert any(line.startswith("[TIMING]") for line in result["trace"])
