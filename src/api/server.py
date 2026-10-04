@@ -35,13 +35,41 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# ── Import your existing agent ────────────────────────────────────────────────
+# ── Import the agent ────────────────────────────────────────────────────────────────
+# AGENT_BACKEND in .env: "graph" (LangGraph + guardrails, default) or
+# "router" (the original rule-based agent, kept for comparison)
+AGENT_BACKEND = os.getenv("AGENT_BACKEND", "graph").lower()
 try:
-    from src.rag.agent import chat as agent_chat, clear_session
+    if AGENT_BACKEND == "router":
+        from src.rag.agent import chat as agent_chat, clear_session
+    else:
+        from src.rag.agent_graph import chat_agent as agent_chat, clear_session
     AGENT_AVAILABLE = True
 except Exception as e:
     AGENT_AVAILABLE = False
     AGENT_ERROR = str(e)
+
+# The frontend shows a "route" badge. The LangGraph agent picks tools instead
+# of routes, so map its tool choices onto the same route names.
+_TOOL_ROUTES = {
+    "recognition_statistics":      "analytical",
+    "search_recognition_messages": "semantic",
+    "find_similar_roles":          "substitution",
+    "recognition_network":         "graph",
+}
+
+
+def _route_for(result: dict) -> str:
+    if result.get("route"):                 # router backend reports its own route
+        return result["route"]
+    if result.get("guard") == "refused":     # blocked by the input guard
+        return "guarded"
+    tools = result.get("tools_used", [])
+    if not tools:
+        return "direct"
+    if len(tools) > 1:
+        return "hybrid"
+    return _TOOL_ROUTES.get(tools[0], "direct")
 
 app = FastAPI(title="Recognition Analytics API", version="1.0.0")
 
@@ -78,30 +106,13 @@ CATEGORY_COLORS = {
 }
 
 def classify_role(title: str) -> str:
+    """Department for a job title. Uses the SAME rules as the agent
+    (config/schema.yaml via src/rag/schema.py), so the dashboard and the
+    agent always agree. Previously this file kept its own outdated copy."""
+    from src.rag.schema import classify_title
     if pd.isna(title):
-        return "Other"
-    t = title.lower()
-    if any(k in t for k in ["customer service", "customer success", "helpdesk"]):
-        return "Customer Service"
-    if any(k in t for k in ["engineer", "software", "qa", "technical", "devops", "architect"]):
-        return "Engineering"
-    if any(k in t for k in ["design", "creative", "ux", "ui", "copywriter", "content"]):
-        return "Design/Creative"
-    if any(k in t for k in ["account", "finance", "payroll", "buyer", "procurement", "financial"]):
-        return "Finance/Admin"
-    if any(k in t for k in ["director", "vp", "head of", "chief", "president", "senior director"]):
-        return "Leadership"
-    if any(k in t for k in ["hr", "hx", "people", "talent", "recruit"]):
-        return "People/HR"
-    if any(k in t for k in ["market", "brand", "media", "pr ", "communications"]):
-        return "Marketing"
-    if any(k in t for k in ["product", "program", "project"]):
-        return "Product/Program"
-    if any(k in t for k in ["data", "analy", "insight", "research"]):
-        return "Data/Analytics"
-    if any(k in t for k in ["sales", "business develop", "revenue"]):
-        return "Sales/BD"
-    return "Other"
+        return classify_title("")
+    return classify_title(str(title))
 
 
 def load_df() -> pd.DataFrame:
@@ -231,6 +242,23 @@ def get_stats():
     top2_pct         = round(float(cat_summary.iloc[0]["pct"]) + float(cat_summary.iloc[1]["pct"]), 1)
     ratio_top_bottom = round(float(top_cat["count"]) / float(bottom_cat["count"]), 1)
 
+    # ── Pulse panel: computed by the same graph code the agent uses ──────────
+    pulse = {"least_recognized": {
+        "name": str(bottom_cat["category_name"]), "pct": float(bottom_cat["pct"]),
+    }}
+    try:
+        from src.rag.graph_tool import central_departments, top_relationships, _dept_graph
+        hub = central_departments(1)
+        link = top_relationships(1, cross_department_only=True)
+        pulse["most_central"] = hub[0][0] if hub else None
+        pulse["strongest_link"] = (
+            {"from": link[0]["from"], "to": link[0]["to"], "count": int(link[0]["count"])}
+            if link else None
+        )
+        pulse["departments"] = _dept_graph().number_of_nodes()
+    except Exception as e:
+        pulse["error"] = str(e)
+
     # ── Sample messages for explorer ──────────────────────────────────────────
     sample_cols = ["message", "award_title", "recipient_title", "nominator_title",
                    "category_name", "category_short", "subcategory_name",
@@ -269,18 +297,24 @@ def get_stats():
         "flows":                 flows,
         "msg_len_by_cat":        msg_len_by_cat,
         "messages":              messages,
+        "pulse":                 pulse,
         "agent_available":       AGENT_AVAILABLE,
     }
 
 
 # ── Groq caller (used by /api/visualize) ──────────────────────────────────────
 
+_viz_limiter = None   # created on first use, for the configured model
+
 def _call_groq(prompt: str) -> str:
     """
-    Calls Groq API with llama-3.3-70b-versatile.
+    Calls Groq with the model from .env (GROQ_MODEL), the same model as the
+    agent. llama-3.3-70b-versatile was retired by Groq on 2026-08-16.
     Returns raw text response. Raises HTTPException on failure.
     """
+    import time
     from groq import Groq
+    from src.utils.llm_usage import RateLimiter, record_usage, extract_usage, estimate_tokens
 
     api_key = os.getenv("GROQ_API_KEY")
     if not api_key:
@@ -289,14 +323,26 @@ def _call_groq(prompt: str) -> str:
             detail="No GROQ_API_KEY found in .env"
         )
 
+    model = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
+    global _viz_limiter
+    if _viz_limiter is None:
+        _viz_limiter = RateLimiter("groq", model)
+
     try:
         client = Groq(api_key=api_key)
+        # gpt-oss reasons before answering, and reasoning uses output tokens,
+        # so the limit is higher than the 1,500 the old model needed
+        _viz_limiter.wait(estimate_tokens(prompt, expected_output=2000))
+        start = time.perf_counter()
         response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model=model,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.1,
-            max_tokens=1500,
+            max_tokens=4000,
         )
+        in_tok, out_tok = extract_usage(response)
+        _viz_limiter.correct(in_tok + out_tok)
+        record_usage("visualize", model, in_tok, out_tok, time.perf_counter() - start)
         return response.choices[0].message.content
     except Exception as e:
         err_str = str(e)
@@ -451,7 +497,7 @@ ROLE_KEYWORDS = [
 def infer_chart_type(route: str, tools_used: list, query: str) -> Optional[str]:
     lq = query.lower()
 
-    if route == "direct":
+    if route == "direct" or route == "guarded":
         return None
     if route == "graph":
         return "flows"
@@ -496,18 +542,22 @@ def chat_endpoint(req: ChatRequest):
 
     try:
         result     = agent_chat(user_input=req.message, session_id=req.session_id)
-        route      = result.get("route", "")
+        route      = _route_for(result)
         tools_used = result.get("tools_used", [])
         chart_type = infer_chart_type(route, tools_used, req.message)
 
         return {
-            "answer":     result.get("answer", ""),
-            "route":      route,
-            "tools_used": tools_used,
-            "confidence": result.get("confidence", ""),
-            "trace":      result.get("trace", []),
-            "crag":       result.get("crag", None),
-            "chart_type": chart_type,
+            "answer":       result.get("answer", ""),
+            "route":        route,
+            "tools_used":   tools_used,
+            "confidence":   result.get("confidence", ""),
+            "trace":        result.get("trace", []),
+            "crag":         result.get("crag", None),
+            "chart_type":   chart_type,
+            "backend":      AGENT_BACKEND,
+            "guard":        result.get("guard"),
+            "input_label":  result.get("input_label"),
+            "cost_usd":     result.get("cost_usd"),
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -526,4 +576,4 @@ def clear_endpoint(req: ClearRequest):
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "agent": AGENT_AVAILABLE}
+    return {"status": "ok", "agent": AGENT_AVAILABLE, "backend": AGENT_BACKEND}

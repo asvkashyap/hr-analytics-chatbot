@@ -15,6 +15,7 @@ const ROUTE_COLORS = {
   SUBSTITUTION: { bg: "#d1fae5", fg: "#065f46" },
   GRAPH:        { bg: "#ede9fe", fg: "#5b21b6" },
   DIRECT:       { bg: "#f1f5f9", fg: "#475569" },
+  GUARDED:      { bg: "#fee2e2", fg: "#991b1b" },
 };
 
 const THEME_COLORS = ["#6366f1", "#f59e0b", "#10b981", "#f43f5e"];
@@ -35,6 +36,7 @@ const FOLLOW_UPS = {
   SUBSTITUTION: ["Compare their recognition profiles", "What skills overlap?", "Show recognition gaps"],
   GRAPH:        ["Show bridge roles", "Strongest mutual pairs", "Most isolated group"],
   DIRECT:       [],
+  GUARDED:      [],
 };
 
 /* ── Helpers ───────────────────────────────────────────────────────────── */
@@ -330,14 +332,12 @@ function SignalCard({ label, value, detail, color }) {
 }
 
 function ContextPanel({ stats }) {
-  const categories = stats?.categories || [
-    { name: "Team Enablement", pct: 44.2 },
-    { name: "Ops Excellence", pct: 34.0 },
-    { name: "Strategic Outcomes", pct: 16.4 },
-    { name: "Creative & Brand", pct: 5.3 },
-  ];
-
-  const totalRecords = stats?.total_records || 999;
+  // Everything here comes from /api/stats, computed by the same code the agent
+  // uses. No hardcoded fallbacks: if data is missing, show "n/a", not old numbers.
+  const categories = stats?.categories || [];
+  const pulse = stats?.pulse || {};
+  const link = pulse.strongest_link;
+  const least = pulse.least_recognized;
 
   return (
     <div style={{
@@ -350,9 +350,15 @@ function ContextPanel({ stats }) {
           Today's pulse
         </div>
         <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-          <SignalCard label="Strongest bond" value="Eng ↔ Eng" detail="158 recognitions" color="#6366f1" />
-          <SignalCard label="Most central hub" value="Marketing" detail="Bridges 8 role groups" color="#f59e0b" />
-          <SignalCard label="Needs attention" value="Creative & Brand" detail="Only 5.3% of recognition" color="#f43f5e" />
+          <SignalCard label="Strongest cross-team link"
+            value={link ? `${link.from} → ${link.to}` : "n/a"}
+            detail={link ? `${link.count} recognitions` : null} color="#6366f1" />
+          <SignalCard label="Most central hub"
+            value={pulse.most_central || "n/a"}
+            detail="Most often bridges other departments" color="#f59e0b" />
+          <SignalCard label="Needs attention"
+            value={least?.name || "n/a"}
+            detail={least ? `Only ${least.pct}% of recognition` : null} color="#f43f5e" />
         </div>
       </div>
 
@@ -363,6 +369,7 @@ function ContextPanel({ stats }) {
           Themes
         </div>
         <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
+          {categories.length === 0 && <span style={{ fontSize: 12, color: "#9ca3af" }}>Loading...</span>}
           {categories.map((c, i) => (
             <div key={i} style={{ display: "flex", alignItems: "center", gap: 8, padding: "3px 0" }}>
               <div style={{ width: 8, height: 8, borderRadius: "50%", background: THEME_COLORS[i] || "#9ca3af", flexShrink: 0 }} />
@@ -380,9 +387,9 @@ function ContextPanel({ stats }) {
           Data scope
         </div>
         {[
-          ["Records", totalRecords],
-          ["Role groups", stats?.role_groups || 11],
-          ["Behaviors", stats?.subcategories || 26],
+          ["Records", stats?.total_records ?? "n/a"],
+          ["Departments", stats?.departments ?? "n/a"],
+          ["Behaviors", stats?.subcategories ?? "n/a"],
         ].map(([label, val], i) => (
           <div key={i} style={{ display: "flex", justifyContent: "space-between", padding: "4px 0" }}>
             <span style={{ fontSize: 12, color: "#9ca3af" }}>{label}</span>
@@ -410,29 +417,19 @@ export default function RecognitionIntelligence() {
       .then(r => r.ok ? r.json() : null)
       .then(d => {
         if (!d) return;
-        let records = [];
-        if (Array.isArray(d)) {
-          records = d;
-        } else {
-          for (const key of Object.keys(d)) {
-            if (Array.isArray(d[key]) && d[key].length > 10) {
-              records = d[key];
-              break;
-            }
-          }
-        }
-        if (records.length > 0) {
-          const counts = {};
-          records.forEach(r => {
-            const cat = r.category_short || r.category_name || "Unknown";
-            counts[cat] = (counts[cat] || 0) + 1;
-          });
-          const total = records.length;
-          const categories = Object.entries(counts)
-            .map(([name, count]) => ({ name, pct: Math.round(count / total * 1000) / 10 }))
-            .sort((a, b) => b.pct - a.pct);
-          setStats({ categories, total_records: total });
-        }
+        // Use the server's computed values directly. (The old code scanned for
+        // the first array longer than 10 items, which was the 26 subcategory
+        // rows, and computed category shares from the wrong data.)
+        const categories = (d.categories || []).map(c => ({
+          name: c.short || c.category_name, pct: c.pct,
+        }));
+        setStats({
+          categories,
+          total_records: d.total,
+          subcategories: d.n_subcategories,
+          departments: d.pulse?.departments,
+          pulse: d.pulse || {},
+        });
       })
       .catch(() => {});
   }, []);
@@ -463,7 +460,9 @@ export default function RecognitionIntelligence() {
       setMessages(prev => [...prev, {
         role: "assistant",
         answer: data.answer || data.response || "No response received.",
-        route: data.route,
+        // Normalize case: the server sends "analytical", the badge and
+        // follow-up lookups use "ANALYTICAL"
+        route: data.route ? data.route.toUpperCase() : undefined,
         tools_used: data.tools_used,
         confidence: data.confidence,
         trace: data.trace,
@@ -484,7 +483,14 @@ export default function RecognitionIntelligence() {
 
   const handleClear = async () => {
     setMessages([]);
-    try { await fetch(`${API_BASE}/clear`, { method: "POST" }); } catch {}
+    try {
+      // The server needs the session id to know which conversation to forget
+      await fetch(`${API_BASE}/clear`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session_id: "dashboard" }),
+      });
+    } catch {}
   };
 
   const handleKeyDown = (e) => {
