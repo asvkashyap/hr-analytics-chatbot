@@ -66,10 +66,12 @@ class TestValidateSchema:
         validate_schema(df, source="test")
 
     def test_raises_on_missing_col(self):
-        df = pd.DataFrame({"message": ["hello"]})
+        # "message" is the required column (award_reason was dropped from the
+        # schema; the current data has no such column)
+        df = pd.DataFrame({"award_title": ["Great work"]})
         with pytest.raises(DataSchemaError) as exc_info:
             validate_schema(df, source="test")
-        assert "award_reason" in exc_info.value.missing_columns
+        assert "message" in exc_info.value.missing_columns
 
 
 class TestValidateDataQuality:

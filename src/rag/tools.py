@@ -31,7 +31,7 @@ DATA_PATH       = Path("output/reports/annotated_results.csv")
 CHROMA_DIR      = Path("chroma_db")
 COLLECTION_NAME = "recognition_records"
 EMBED_MODEL     = "all-MiniLM-L6-v2"
-TOP_K           = 20
+TOP_K           = 5
 
 # ---------------------------------------------------------------------------
 # Singletons — loaded once, reused across all tool calls
@@ -162,9 +162,10 @@ def pandas_analytics(query: str) -> str:
     ])
 
     is_nominator_query = any(w in q for w in [
-        "nominator", "who gave", "who recognized", "giver",
-        "who nominated", "who gives", "who nominates",
-    ])
+    "nominator", "who gave", "who recognized", "giver",
+    "who nominated", "who gives", "who nominates",
+    "which role group gives", "which group gives",
+  ])
 
     is_award_query = any(w in q for w in [
         "award title", "award type", "award name",
@@ -176,8 +177,10 @@ def pandas_analytics(query: str) -> str:
     ])
 
     is_give_receive_query = any(w in q for w in [
-        "give vs receive", "give and receive", "give versus receive",
-        "giving vs receiving", "give more", "receive more",
+    "give vs receive", "give and receive", "give versus receive",
+    "giving vs receiving", "give more", "receive more",
+    "gives the most", "gives most", "most recognition",
+    "who gives", "most nominations", "most nominat",
     ])
 
     # --- Theme/topic questions → show category + subcategory breakdown ---
@@ -187,7 +190,9 @@ def pandas_analytics(query: str) -> str:
         results.append("=== Category Distribution (What People Are Recognized For) ===")
         for cat, cnt in counts.items():
             results.append(f"  {cat}: {cnt} records ({pcts[cat]}%)")
-        results.append(f"  Total: {len(df)} records\n")
+        # Tools compute, the LLM reports: print the total row so the agent
+        # never has to compute it (the number guard rejects computed totals)
+        results.append(f"  Total: {len(df)} records (100.0%)\n")
 
         # Also show top subcategories for theme queries
         if is_theme_query:
@@ -219,6 +224,7 @@ def pandas_analytics(query: str) -> str:
             cnt = cat_counts[cat]
             pct = round(cnt / len(df) * 100, 1)
             results.append(f"  {cat}: {cnt} records ({pct}%)")
+        results.append(f"  Total: {len(df)} records (100.0%)")
         results.append("")
 
         # Show bottom subcategories

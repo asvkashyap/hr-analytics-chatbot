@@ -1,0 +1,80 @@
+# =============================================================================
+# Guardrail settings
+# =============================================================================
+
+pii:
+  # spaCy model Presidio uses to recognize names from context.
+  # en_core_web_lg (~400 MB) is more accurate; en_core_web_sm (~12 MB) is lighter.
+  spacy_model: en_core_web_lg
+
+  # What gets redacted. Job titles, departments, and products are NOT personal
+  # data and stay visible, since they are what the analytics are about.
+  entities: [PERSON, EMAIL_ADDRESS, PHONE_NUMBER]
+
+  # Minimum detector confidence (0 to 1) to redact
+  score_threshold: 0.4
+
+  # Words the name detector can mistake for people. Never redacted.
+  # Department names from schema.yaml are added automatically.
+  allowlist:
+    - Workhuman
+    - WHiQ
+    - Insights
+    - Conversations
+    - Teams
+
+injection:
+  # Prompt Guard 2 on Groq returns the probability (0 to 1) that text is a
+  # jailbreak or prompt injection.
+  model: meta-llama/llama-prompt-guard-2-86m
+  threshold: 0.5            # block at or above this score; tune with the red-team set
+  chunk_chars: 1500         # Prompt Guard reads short inputs; longer text is scored in pieces
+  scan_tool_results: true   # recognition messages are employee-written, so scan them too
+
+scope:
+  # Small model that sorts each question into one label
+  model: openai/gpt-oss-20b
+  max_tokens: 1000
+  fail_open: true           # if the check errors, let the question through and log it
+
+# =============================================================================
+# What users see. Owned by HR / legal: edit the wording here, not in code.
+# =============================================================================
+messages:
+  off_topic: >
+    I can only answer questions about your organization's recognition data.
+    For example, I can show which categories are recognized most, how departments
+    recognize each other, or what kinds of messages a team writes.
+
+  hr_general: >
+    I answer questions about your organization's recognition data rather than
+    general HR advice. I can show you, for example, which categories are recognized
+    least or which roles connect the most departments, which may help inform your program.
+
+  protected_attribute: >
+    That's an important question, but I can't answer it with this data. It doesn't
+    include demographic information, and inferring characteristics like gender, age,
+    or ethnicity from names or titles would be unreliable and unfair. Analysis of
+    fairness across groups should use properly collected demographic data with
+    appropriate privacy and legal review.
+
+  injection: >
+    I can't process that request. I can answer questions about your organization's
+    recognition data.
+
+  # Starts answers to questions about a specific person
+  individual_opener: >
+    I don't evaluate individual people. Recognition data reflects how colleagues
+    describe each other's work, not a measure of anyone's performance. Here is what
+    the data shows at the team and role level:
+
+  # Ends answers to succession and role questions
+  workforce_note: >
+    Note: Recognition patterns reflect how colleagues describe each other's work.
+    They are not an assessment of capability or readiness for a role. Use them,
+    if at all, as one input alongside human review of the full context.
+
+  # Replaces a recognition message that looked like instructions to the assistant
+  tool_withheld: >
+    [Withheld: this result contained text resembling instructions to the assistant,
+    so it was not shown to the model.]

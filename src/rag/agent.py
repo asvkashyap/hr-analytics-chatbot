@@ -22,39 +22,33 @@ from groq import Groq
 
 from src.rag.tools import vector_search, pandas_analytics, substitution
 from src.rag.router import QueryRouter, RouteType, CRAGChecker
+from src.rag.schema import describe_dataset
+from src.utils.llm_usage import (
+    RateLimiter, record_usage, extract_usage, estimate_tokens, retry_after,
+)
 
-# Try Neo4j first, fall back to NetworkX
+# Neo4j removed: the graph layer is NetworkX only (src/rag/graph_tool.py).
+# Kept as a flag so _run_tools still routes any neo4j_query request to NetworkX.
 NEO4J_AVAILABLE = False
-try:
-    from src.rag.neo4j_tool import neo4j_query
-    neo4j_query("test")
-    NEO4J_AVAILABLE = True
-except Exception:
-    pass
 
-# Always import graph_tool as fallback
-try:
-    from src.rag.graph_tool import graph_query
-except ImportError:
-    def graph_query(q):
-        return "Graph tool not available."
+from src.rag.graph_tool import graph_query
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 
-GROQ_MODEL  = "llama-3.3-70b-versatile"
+# Groq retired llama-3.3-70b-versatile on 2026-08-16 (free/developer tiers).
+# Override with GROQ_MODEL in .env, e.g. qwen/qwen3.6-27b
+GROQ_MODEL  = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 TEMPERATURE = 0.3
 MAX_TOKENS  = 2000
 MAX_HISTORY = 10
 RETRY_SLEEP = 3
 
-SYSTEM_PROMPT = """You are an expert HR analytics assistant for a recognition intelligence platform.
+SYSTEM_PROMPT = f"""You are an expert HR analytics assistant for a recognition intelligence platform.
 
-You have access to 999 recognition records classified into:
-- 4 main categories: Organizational & Team Enablement, Operational Excellence & Delivery,
-  Strategic Business Outcomes, Creative & Brand Impact
-- 26 subcategories
-- A Neo4j graph database with 372 role nodes, 11 role group nodes, and 819 relationships
+You have access to recognition data with:
+{describe_dataset()}
+- A recognition network graph connecting departments and job titles
 
 Your job is to answer questions clearly and insightfully using the context provided.
 
@@ -84,20 +78,32 @@ def _get_client() -> Groq:
     return _client
 
 
+_limiter = RateLimiter("groq", GROQ_MODEL)   # this model's own window; limits in config/pricing.yaml
+
+
 def _call_groq(messages: list, trace: list, max_retries: int = 3) -> str:
     client = _get_client()
     last_error = None
+    est = estimate_tokens("".join(m["content"] for m in messages), expected_output=MAX_TOKENS // 2)
 
     for attempt in range(max_retries):
         try:
+            waited = _limiter.wait(est)
+            if waited:
+                trace.append(f"[GROQ] Waited {waited:.1f}s for the rate limit window")
             trace.append(f"[GROQ] Sending request (attempt {attempt + 1})...")
+            start = time.perf_counter()
             response = client.chat.completions.create(
                 model=GROQ_MODEL,
                 messages=messages,
                 temperature=TEMPERATURE,
                 max_tokens=MAX_TOKENS,
             )
-            trace.append("[GROQ] Response received.")
+            in_tok, out_tok = extract_usage(response)
+            _limiter.correct(in_tok + out_tok)
+            cost = record_usage("agent_router", GROQ_MODEL, in_tok, out_tok,
+                                time.perf_counter() - start, wait_s=round(waited, 2))
+            trace.append(f"[GROQ] Response received. {in_tok} in + {out_tok} out tokens, ${cost:.5f}")
             return response.choices[0].message.content
 
         except Exception as e:
@@ -105,7 +111,7 @@ def _call_groq(messages: list, trace: list, max_retries: int = 3) -> str:
             err_str = str(e)
 
             if "429" in err_str or "rate_limit" in err_str.lower():
-                wait = RETRY_SLEEP * (attempt + 1)
+                wait = retry_after(e, default=RETRY_SLEEP * (attempt + 1))
                 trace.append(f"[GROQ] Rate limit hit — waiting {wait}s...")
                 time.sleep(wait)
             elif "503" in err_str or "unavailable" in err_str.lower():
