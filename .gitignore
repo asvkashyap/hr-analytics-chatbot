@@ -13,4 +13,13 @@ dist/
 *.csv
 *.json
 !data/raw/mockup_awards.csv
-!output/reports/compressed_taxonomy_with_ids.json
+!output/reports/taxonomy/compressed_taxonomy_with_ids.json
+# The frontend can't be installed without these, so they must be tracked
+!package.json
+!package-lock.json
+
+# Rebuilt automatically from the data and config/schema.yaml
+output/graphs/
+# Personal editor settings and test caches
+*.code-workspace
+.pytest_cache/

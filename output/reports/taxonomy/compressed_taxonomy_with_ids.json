@@ -1,0 +1,132 @@
+{
+  "recognition_taxonomy": {
+    "Strategic Business Outcomes": {
+      "id": "A",
+      "description": "Recognition for contributions that directly lead to increased revenue, market share, customer acquisition, or significant strategic advancements for the organization.",
+      "subcategories": [
+        {
+          "id": "A1",
+          "name": "Business Growth & Client Success"
+        },
+        {
+          "id": "A2",
+          "name": "Customer Experience & Engagement"
+        },
+        {
+          "id": "A3",
+          "name": "Strategic Direction & Innovation"
+        }
+      ]
+    },
+    "Operational Excellence & Delivery": {
+      "id": "B",
+      "description": "Recognition for efficient and effective execution of projects, processes, and support functions, ensuring smooth operations and high-quality output.",
+      "subcategories": [
+        {
+          "id": "B1",
+          "name": "Project & Process Management"
+        },
+        {
+          "id": "B2",
+          "name": "Technical & System Operations"
+        },
+        {
+          "id": "B3",
+          "name": "Financial & Administrative Services"
+        },
+        {
+          "id": "B4",
+          "name": "Vendor & Supply Chain Management"
+        },
+        {
+          "id": "B5",
+          "name": "Risk, Compliance & Security"
+        },
+        {
+          "id": "B6",
+          "name": "Operational Continuity & Incident Response"
+        },
+        {
+          "id": "B7",
+          "name": "Data & Analytics"
+        },
+        {
+          "id": "B8",
+          "name": "Legal & Contractual Support"
+        },
+        {
+          "id": "B9",
+          "name": "Digital Accessibility & Inclusivity"
+        }
+      ]
+    },
+    "Creative & Brand Impact": {
+      "id": "C",
+      "description": "Recognition for developing compelling content, designing impactful visuals, and effectively communicating messages that enhance brand perception and engagement.",
+      "subcategories": [
+        {
+          "id": "C1",
+          "name": "Content Strategy & Creation"
+        },
+        {
+          "id": "C2",
+          "name": "Visual Design & Branding"
+        },
+        {
+          "id": "C3",
+          "name": "Marketing Campaign Management"
+        },
+        {
+          "id": "C4",
+          "name": "Brand & Content Governance"
+        },
+        {
+          "id": "C5",
+          "name": "Public Relations & Media Engagement"
+        }
+      ]
+    },
+    "Organizational & Team Enablement": {
+      "id": "D",
+      "description": "Recognition for fostering a positive work environment, supporting colleagues, facilitating learning, and contributing to the growth and cohesion of teams and the wider organization.",
+      "subcategories": [
+        {
+          "id": "D1",
+          "name": "Team Collaboration & Integration"
+        },
+        {
+          "id": "D2",
+          "name": "Learning & Professional Development"
+        },
+        {
+          "id": "D3",
+          "name": "Culture & Workplace Experience"
+        },
+        {
+          "id": "D4",
+          "name": "Organizational Change & Process Improvement"
+        },
+        {
+          "id": "D5",
+          "name": "Diversity, Equity & Inclusion (DEI) Support"
+        },
+        {
+          "id": "D6",
+          "name": "Leadership & Mentorship"
+        },
+        {
+          "id": "D7",
+          "name": "People Operations & Talent Management"
+        },
+        {
+          "id": "D8",
+          "name": "Personal Milestones & Well-being"
+        },
+        {
+          "id": "D9",
+          "name": "External Engagement & Partnerships"
+        }
+      ]
+    }
+  }
+}
