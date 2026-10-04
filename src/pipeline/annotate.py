@@ -17,6 +17,7 @@ from tqdm import tqdm
 from src.utils.config_loader import get_config, get_gemini_api_key, get_log_level
 from src.utils.data_utils import clean_dataframe, load_csv, validate_schema
 from src.utils.logging_config import get_logger, setup_logging
+from src.utils.llm_usage import RateLimiter, record_usage, extract_usage, estimate_tokens, summarize
 
 setup_logging(get_log_level())
 logger = get_logger(__name__)
@@ -28,7 +29,8 @@ GEMINI_URL = (
     + ":generateContent"
 )
 RETRIES_PER_KEY = 2
-SLEEP_BETWEEN = 6
+SLEEP_BETWEEN = 6   # fixed pause kept as a safety margin; the limiter below adapts to real usage
+_limiter = RateLimiter("gemini")   # limits come from config/pricing.yaml
 
 SYSTEM_PROMPT = """You are an HR researcher annotating employee recognition messages.
 For each message, assign the single best matching category and subcategory from the taxonomy.
@@ -85,8 +87,15 @@ def call_gemini(prompt, api_key):
         url, data=data, headers={"Content-Type": "application/json"}
     )
 
+    _limiter.wait(estimate_tokens(SYSTEM_PROMPT + prompt, expected_output=4000))
+    start = time.perf_counter()
     with urllib.request.urlopen(req, timeout=60) as resp:
         result = json.loads(resp.read().decode("utf-8"))
+
+    # Log tokens and cost (thinking tokens count as output)
+    in_tok, out_tok = extract_usage(result)
+    _limiter.correct(in_tok + out_tok)
+    record_usage("annotation", MODEL, in_tok, out_tok, time.perf_counter() - start)
 
     return result["candidates"][0]["content"]["parts"][0]["text"].strip()
 
@@ -284,6 +293,7 @@ def run(cfg=None):
     print("Total:     " + str(len(df)))
     print("Annotated: " + str(len(all_results)))
     print("Failed:    " + str(len(failed_rows)))
+    print("\n" + summarize())
 
     if all_results:
         results_df = pd.DataFrame(all_results)
