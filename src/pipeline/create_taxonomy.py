@@ -19,6 +19,7 @@ from src.utils.data_utils import clean_dataframe, format_award_info, load_csv, v
 from src.utils.exceptions import TaxonomyParseError, LLMRateLimitError
 from src.utils.json_utils import extract_json, safe_dumps
 from src.utils.logging_config import get_logger, setup_logging
+from src.utils.llm_usage import summarize
 
 setup_logging(get_log_level())
 logger = get_logger(__name__)
@@ -135,7 +136,7 @@ def run(cfg=None):
     df["row_in_batch"] = "row" + ((np.arange(len(df)) % batch_size) + 1).astype(str)
     df["summary_dict_batch"] = df["row_in_batch"] + ": " + df["formatted_info"]
 
-    client = GeminiClient()
+    client = GeminiClient(component="taxonomy")
 
     start_batch = tax_cfg["start_batch"]
     compress_every = tax_cfg["compress_every_n_batches"]
@@ -226,6 +227,7 @@ def run(cfg=None):
 
     logger.info("Taxonomy saved to " + str(final_path))
     logger.info("Total cost: $" + str(round(total_cost, 4)))
+    print("\n" + summarize())
 
     print("\n=== TAXONOMY SUMMARY ===")
     for cat_name, cat_data in taxonomy_with_ids["recognition_taxonomy"].items():

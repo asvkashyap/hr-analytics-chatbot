@@ -1,0 +1,14 @@
+RAGAS EVALUATION SUMMARY
+========================================
+
+Model               : llama-3.3-70b-versatile
+Questions evaluated : 10
+Route types tested  : Analytical, Semantic, Graph, Hybrid
+
+SCORES:
+  Faithfulness      : 0.833
+  Answer Relevancy  : 0.620
+  Context Precision : 0.281
+  Overall           : 0.578
+
+Grade: Fair

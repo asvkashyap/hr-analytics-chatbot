@@ -31,7 +31,37 @@ DATA_PATH       = Path("output/reports/annotated_results.csv")
 CHROMA_DIR      = Path("chroma_db")
 COLLECTION_NAME = "recognition_records"
 EMBED_MODEL     = "all-MiniLM-L6-v2"
-TOP_K           = 20
+TOP_K           = 5
+
+
+# ---------------------------------------------------------------------------
+# Retrieval check (moved from router.py when the router was retired)
+# Keyword overlap between the question and the search results. The agent
+# reads the warning and decides what to do. Planned to be replaced by a
+# cross-encoder reranker score.
+# ---------------------------------------------------------------------------
+
+class CRAGChecker:
+    def __init__(self, threshold: float = 0.25):
+        self.threshold = threshold
+
+    def check(self, query: str, retrieved_text: str) -> dict:
+        score = self._overlap_score(query, retrieved_text)
+        if score >= self.threshold:
+            return {"score": score, "passed": True,  "action": "proceed"}
+        elif score >= self.threshold * 0.5:
+            return {"score": score, "passed": False, "action": "rerank"}
+        else:
+            return {"score": score, "passed": False, "action": "fallback"}
+
+    def _overlap_score(self, query: str, text: str) -> float:
+        if not text:
+            return 0.0
+        q_words = set(re.findall(r"\b\w{3,}\b", query.lower()))
+        t_words = set(re.findall(r"\b\w{3,}\b", text.lower()))
+        if not q_words:
+            return 0.0
+        return len(q_words & t_words) / len(q_words)
 
 # ---------------------------------------------------------------------------
 # Singletons — loaded once, reused across all tool calls
@@ -162,9 +192,10 @@ def pandas_analytics(query: str) -> str:
     ])
 
     is_nominator_query = any(w in q for w in [
-        "nominator", "who gave", "who recognized", "giver",
-        "who nominated", "who gives", "who nominates",
-    ])
+    "nominator", "who gave", "who recognized", "giver",
+    "who nominated", "who gives", "who nominates",
+    "which role group gives", "which group gives",
+  ])
 
     is_award_query = any(w in q for w in [
         "award title", "award type", "award name",
@@ -176,8 +207,10 @@ def pandas_analytics(query: str) -> str:
     ])
 
     is_give_receive_query = any(w in q for w in [
-        "give vs receive", "give and receive", "give versus receive",
-        "giving vs receiving", "give more", "receive more",
+    "give vs receive", "give and receive", "give versus receive",
+    "giving vs receiving", "give more", "receive more",
+    "gives the most", "gives most", "most recognition",
+    "who gives", "most nominations", "most nominat",
     ])
 
     # --- Theme/topic questions → show category + subcategory breakdown ---
@@ -187,7 +220,9 @@ def pandas_analytics(query: str) -> str:
         results.append("=== Category Distribution (What People Are Recognized For) ===")
         for cat, cnt in counts.items():
             results.append(f"  {cat}: {cnt} records ({pcts[cat]}%)")
-        results.append(f"  Total: {len(df)} records\n")
+        # Tools compute, the LLM reports: print the total row so the agent
+        # never has to compute it (the number guard rejects computed totals)
+        results.append(f"  Total: {len(df)} records (100.0%)\n")
 
         # Also show top subcategories for theme queries
         if is_theme_query:
@@ -219,6 +254,7 @@ def pandas_analytics(query: str) -> str:
             cnt = cat_counts[cat]
             pct = round(cnt / len(df) * 100, 1)
             results.append(f"  {cat}: {cnt} records ({pct}%)")
+        results.append(f"  Total: {len(df)} records (100.0%)")
         results.append("")
 
         # Show bottom subcategories

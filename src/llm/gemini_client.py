@@ -6,26 +6,30 @@ from src.llm.base_client import BaseLLMClient, LLMResponse
 from src.utils.config_loader import get_config, get_gemini_api_key
 from src.utils.exceptions import LLMAuthError, LLMRateLimitError, LLMTimeoutError, LLMResponseError
 from src.utils.logging_config import get_cost_logger, get_logger
+from src.utils.llm_usage import RateLimiter, record_usage, extract_usage, price_for, estimate_tokens
 
 logger = get_logger(__name__)
 cost_logger = get_cost_logger()
+_limiter = RateLimiter("gemini")   # limits come from config/pricing.yaml
 
 
 class GeminiClient(BaseLLMClient):
 
-    def __init__(self, override_model=None):
+    def __init__(self, override_model=None, component="gemini_client"):
         cfg = get_config()["llm"]
         api_key = get_gemini_api_key()
 
         self.client = genai.Client(api_key=api_key)
         self.model_name = override_model or cfg["model"]
+        self.component = component
         self.default_temperature = cfg.get("temperature", 0.1)
         self.max_output_tokens = cfg.get("max_output_tokens", 4096)
         self.timeout = cfg.get("timeout_seconds", 60)
 
-        pricing = cfg.get("pricing", {})
-        self._input_cost_per_m = pricing.get("input_per_million", 1.25)
-        self._output_cost_per_m = pricing.get("output_per_million", 5.00)
+        # Prices now come from config/pricing.yaml (shared with the agents)
+        pricing = price_for(self.model_name)
+        self._input_cost_per_m = pricing["input_per_million"]
+        self._output_cost_per_m = pricing["output_per_million"]
 
         logger.info("GeminiClient initialised | model=" + self.model_name)
 
@@ -49,6 +53,7 @@ class GeminiClient(BaseLLMClient):
     )
     def _complete_with_retry(self, prompt, temperature=None):
         temp = temperature if temperature is not None else self.default_temperature
+        _limiter.wait(estimate_tokens(prompt, expected_output=self.max_output_tokens))
         start = time.perf_counter()
 
         try:
@@ -77,10 +82,12 @@ class GeminiClient(BaseLLMClient):
         except Exception as exc:
             raise LLMResponseError(str(response)) from exc
 
-        input_tokens = getattr(response.usage_metadata, "prompt_token_count", 0) or 0
-        output_tokens = getattr(response.usage_metadata, "candidates_token_count", 0) or 0
+        # extract_usage counts thinking tokens as output, since Gemini bills them that way
+        input_tokens, output_tokens = extract_usage(response)
+        _limiter.correct(input_tokens + output_tokens)
         input_cost = (input_tokens / 1_000_000) * self._input_cost_per_m
         output_cost = (output_tokens / 1_000_000) * self._output_cost_per_m
+        record_usage(self.component, self.model_name, input_tokens, output_tokens, elapsed)
 
         result = LLMResponse(
             text=text,

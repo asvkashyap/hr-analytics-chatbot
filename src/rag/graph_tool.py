@@ -1,349 +1,395 @@
 """
-src/rag/graph_tool.py — GraphRAG Tool for Relationship Queries
-==============================================================
-Builds a NetworkX directed graph from recognition data.
-Nodes = role groups, Edges = recognition events between them.
+src/rag/graph_tool.py - Recognition network analysis with NetworkX
+==================================================================
+Two graphs, both built from the standard schema (see schema.py):
+  - Department graph: departments are nodes, edge weight = recognitions
+    given from one department to another.
+  - Role graph: job titles are nodes, same idea at title level.
+    Used for bridge roles that span multiple departments.
 
-Answers questions like:
-  - Which departments recognize each other most?
-  - Who are the most connected recognizers?
-  - What is the recognition flow between Leadership and Engineering?
-  - Which roles are most central in the recognition network?
+Built with pandas groupby (fast on large datasets) and cached to disk.
+The cache is tied to the data file and the schema settings, so editing
+either one triggers a rebuild.
+
+The structured functions (top_relationships, bridge_roles, ...) are the
+building blocks. graph_query() keeps the old keyword interface so the
+router and agent keep working unchanged.
 
 Usage:
     from src.rag.graph_tool import graph_query
-    result = graph_query("which departments recognize each other most?")
+    print(graph_query("which departments recognize each other most?"))
 """
 
+import pickle
+import re
 import warnings
+from pathlib import Path
+
+import networkx as nx
+import pandas as pd
+
+from src.rag.schema import load_dataset, load_schema, dataset_name, schema_fingerprint
+
 warnings.filterwarnings("ignore")
 
-import re
-from pathlib import Path
-from collections import defaultdict
+CACHE_DIR = Path("output/graphs")
+EXACT_CENTRALITY_MAX_NODES = 500   # above this, use sampled betweenness
+CENTRALITY_SAMPLE_K = 200
 
-import pandas as pd
-import networkx as nx
-
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
-
-DATA_PATH = Path("output/reports/annotated_results.csv")
-
-# Role group classifier — same logic as dashboard.py for consistency
-def classify_role(title: str) -> str:
-    if not title or pd.isna(title):
-        return "Other"
-    t = title.lower()
-    if any(k in t for k in ["customer service", "customer success", "helpdesk"]):
-        return "Customer Service"
-    if any(k in t for k in ["engineer", "software", "qa", "technical", "devops", "architect"]):
-        return "Engineering"
-    if any(k in t for k in ["design", "creative", "ux", "ui", "copywriter", "content"]):
-        return "Design / Creative"
-    if any(k in t for k in ["account", "finance", "payroll", "buyer", "procurement", "financial"]):
-        return "Finance / Admin"
-    if any(k in t for k in ["director", "vp", "head of", "chief", "president", "senior director"]):
-        return "Leadership"
-    if any(k in t for k in ["hr", "hx", "people", "talent", "recruit"]):
-        return "People / HR"
-    if any(k in t for k in ["market", "brand", "media", "pr ", "communications"]):
-        return "Marketing"
-    if any(k in t for k in ["product", "program", "project"]):
-        return "Product / Program"
-    if any(k in t for k in ["data", "analy", "insight", "research"]):
-        return "Data / Analytics"
-    if any(k in t for k in ["sales", "business develop", "revenue"]):
-        return "Sales / BD"
-    return "Other"
+_graphs: dict | None = None
 
 
 # ---------------------------------------------------------------------------
-# Graph builder — singleton
+# Build (groupby, not row loops) and cache
 # ---------------------------------------------------------------------------
 
-_graph: nx.DiGraph | None = None
-_df: pd.DataFrame | None  = None
+def _most_common(df: pd.DataFrame, keys: list[str], value: str) -> pd.DataFrame:
+    """Most frequent `value` per group, vectorized (no per-group Python calls)."""
+    counts = df.groupby(keys + [value], observed=True).size().reset_index(name="_n")
+    return (
+        counts.sort_values("_n", ascending=False, kind="stable")
+        .drop_duplicates(keys)
+        .drop(columns="_n")
+    )
 
 
-def _load_df() -> pd.DataFrame:
-    global _df
-    if _df is None:
-        _df = pd.read_csv(DATA_PATH)
-        for col in _df.select_dtypes(include="object").columns:
-            _df[col] = _df[col].fillna("").astype(str)
-        _df["nom_group"] = _df["nominator_title"].apply(classify_role)
-        _df["rec_group"]  = _df["recipient_title"].apply(classify_role)
-    return _df
+def _edge_table(df: pd.DataFrame, src: str, dst: str) -> pd.DataFrame:
+    """One row per (src, dst) pair: recognition count and most common category."""
+    weights = df.groupby([src, dst], observed=True).size().reset_index(name="weight")
+    top_cat = _most_common(df, [src, dst], "category").rename(columns={"category": "top_category"})
+    return weights.merge(top_cat, on=[src, dst])
 
 
-def _build_graph() -> nx.DiGraph:
-    """
-    Build directed graph where:
-      - Nodes = role groups
-      - Edges = recognition events (nominator_group → recipient_group)
-      - Edge weight = number of recognitions
-    """
-    global _graph
-    if _graph is not None:
-        return _graph
-
-    df = _load_df()
-
-    G = nx.DiGraph()
-
-    # Count edges
-    edge_counts: dict[tuple, int] = defaultdict(int)
-    edge_categories: dict[tuple, list] = defaultdict(list)
-
-    for _, row in df.iterrows():
-        nom_group = row["nom_group"]
-        rec_group  = row["rec_group"]
-        category   = row["category_name"]
-        edge_counts[(nom_group, rec_group)] += 1
-        edge_categories[(nom_group, rec_group)].append(category)
-
-    # Add nodes with attributes
-    all_groups = set()
-    for (src, tgt) in edge_counts:
-        all_groups.add(src)
-        all_groups.add(tgt)
-
-    for group in all_groups:
-        group_df = df[df["rec_group"] == group]
-        G.add_node(
-            group,
-            total_received=len(group_df),
-            top_category=group_df["category_name"].value_counts().index[0] if len(group_df) > 0 else "N/A",
-        )
-
-    # Add edges with weights
-    for (src, tgt), weight in edge_counts.items():
-        cats = edge_categories[(src, tgt)]
-        top_cat = max(set(cats), key=cats.count)
-        G.add_edge(src, tgt, weight=weight, top_category=top_cat)
-
-    _graph = G
-    return _graph
+def _graph_from_edges(edges: pd.DataFrame, src: str, dst: str) -> nx.DiGraph:
+    return nx.from_pandas_edgelist(
+        edges, source=src, target=dst,
+        edge_attr=["weight", "top_category"], create_using=nx.DiGraph,
+    )
 
 
-# ---------------------------------------------------------------------------
-# Graph query tool
-# ---------------------------------------------------------------------------
-
-def graph_query(query: str) -> str:
-    """
-    Answer relationship/network questions about the recognition graph.
-
-    Args:
-        query: Natural language question about relationships
-
-    Returns:
-        Formatted string with graph analysis results
-    """
-    G  = _build_graph()
-    df = _load_df()
-    q  = query.lower()
-    results = []
-
-    # --- Most connected pairs (strongest relationships) ---
-    if any(w in q for w in ["most", "strongest", "top", "highest", "between", "each other", "connected"]):
-        edges = sorted(G.edges(data=True), key=lambda x: x[2]["weight"], reverse=True)
-        n = _extract_n(q, default=10)
-        results.append(f"=== Top {n} Strongest Recognition Relationships ===\n")
-        for src, tgt, data in edges[:n]:
-            results.append(
-                f"  {src} → {tgt}: {data['weight']} recognitions "
-                f"(top category: {data['top_category']})"
-            )
-        results.append("")
-
-    # --- Most giving groups (out-degree) ---
-    if any(w in q for w in ["give", "gave", "nominate", "most recogni", "who recogni"]):
-        out_weights = {
-            node: sum(d["weight"] for _, _, d in G.out_edges(node, data=True))
-            for node in G.nodes()
-        }
-        sorted_givers = sorted(out_weights.items(), key=lambda x: x[1], reverse=True)
-        n = _extract_n(q, default=5)
-        results.append(f"=== Top {n} Recognition Givers (by volume) ===\n")
-        for group, total in sorted_givers[:n]:
-            results.append(f"  {group}: {total} recognitions given")
-        results.append("")
-
-    # --- Most receiving groups (in-degree) ---
-    if any(w in q for w in ["receive", "received", "most awarded", "who received", "most recognized"]):
-        in_weights = {
-            node: sum(d["weight"] for _, _, d in G.in_edges(node, data=True))
-            for node in G.nodes()
-        }
-        sorted_receivers = sorted(in_weights.items(), key=lambda x: x[1], reverse=True)
-        n = _extract_n(q, default=5)
-        results.append(f"=== Top {n} Recognition Receivers (by volume) ===\n")
-        for group, total in sorted_receivers[:n]:
-            results.append(f"  {group}: {total} recognitions received")
-        results.append("")
-
-    # --- Centrality — most influential nodes ---
-    if any(w in q for w in ["central", "influential", "important", "hub", "key"]):
-        centrality = nx.betweenness_centrality(G, weight="weight")
-        sorted_central = sorted(centrality.items(), key=lambda x: x[1], reverse=True)
-        results.append("=== Most Central Role Groups (Network Influence) ===\n")
-        for group, score in sorted_central[:5]:
-            results.append(f"  {group}: centrality score = {score:.3f}")
-        results.append("")
-
-    # --- Self-recognition (same group recognizing itself) ---
-    if any(w in q for w in ["self", "same", "within", "internal"]):
-        results.append("=== Within-Group Recognition (Self-loops) ===\n")
-        for node in G.nodes():
-            if G.has_edge(node, node):
-                weight = G[node][node]["weight"]
-                results.append(f"  {node} → {node}: {weight} internal recognitions")
-        results.append("")
-
-    # --- Specific group lookup ---
-    group_match = _detect_group(q)
-    if group_match:
-        results.append(f"=== Recognition Network for '{group_match}' ===\n")
-
-        # What they give
-        out_edges = sorted(
-            [(tgt, d["weight"], d["top_category"]) for _, tgt, d in G.out_edges(group_match, data=True)],
-            key=lambda x: x[1], reverse=True
-        )
-        if out_edges:
-            results.append(f"  Recognizes others:")
-            for tgt, weight, cat in out_edges[:5]:
-                results.append(f"    → {tgt}: {weight} times (mainly: {cat})")
-
-        # What they receive
-        in_edges = sorted(
-            [(src, d["weight"], d["top_category"]) for src, _, d in G.in_edges(group_match, data=True)],
-            key=lambda x: x[1], reverse=True
-        )
-        if in_edges:
-            results.append(f"\n  Recognized by:")
-            for src, weight, cat in in_edges[:5]:
-                results.append(f"    ← {src}: {weight} times (mainly: {cat})")
-        results.append("")
-
-    # --- Network overview fallback ---
-    if not results:
-        results.append("=== Recognition Network Overview ===\n")
-        results.append(f"  Nodes (role groups): {G.number_of_nodes()}")
-        results.append(f"  Edges (relationships): {G.number_of_edges()}")
-        results.append(f"  Total recognitions: {sum(d['weight'] for _, _, d in G.edges(data=True))}")
-        results.append("")
-
-        # Top 5 relationships
-        edges = sorted(G.edges(data=True), key=lambda x: x[2]["weight"], reverse=True)
-        results.append("  Top 5 strongest relationships:")
-        for src, tgt, data in edges[:5]:
-            results.append(f"    {src} → {tgt}: {data['weight']} recognitions")
-        results.append("")
-
-        # Degree summary
-        results.append("  Role groups by recognition received:")
-        in_weights = {
-            node: sum(d["weight"] for _, _, d in G.in_edges(node, data=True))
-            for node in G.nodes()
-        }
-        for group, total in sorted(in_weights.items(), key=lambda x: x[1], reverse=True):
-            results.append(f"    {group}: {total}")
-
-    return "\n".join(results)
+def _build() -> dict:
+    df = load_dataset()
+    dept = _graph_from_edges(
+        _edge_table(df, "giver_department", "receiver_department"),
+        "giver_department", "receiver_department",
+    )
+    role = _graph_from_edges(
+        _edge_table(df, "giver_title", "receiver_title"),
+        "giver_title", "receiver_title",
+    )
+    # Department each title belongs to (most common), for bridge-role output
+    both_sides = pd.concat([
+        df[["giver_title", "giver_department"]].set_axis(["title", "department"], axis=1),
+        df[["receiver_title", "receiver_department"]].set_axis(["title", "department"], axis=1),
+    ])
+    title_dept = _most_common(both_sides, ["title"], "department").set_index("title")["department"].to_dict()
+    nx.set_node_attributes(role, title_dept, "department")
+    return {"department": dept, "role": role}
 
 
-def get_graph_stats() -> dict:
-    """
-    Return key graph statistics for display in dashboard.
-    """
-    G  = _build_graph()
-    df = _load_df()
+def _load_graphs() -> dict:
+    global _graphs
+    if _graphs is not None:
+        return _graphs
 
-    edges      = sorted(G.edges(data=True), key=lambda x: x[2]["weight"], reverse=True)
-    centrality = nx.betweenness_centrality(G, weight="weight")
+    source = Path(load_schema()["dataset"]["path"])
+    # Tied to the data file AND the schema settings: editing department
+    # rules or column mappings produces a new fingerprint and a rebuild
+    cache = CACHE_DIR / f"{dataset_name()}_{schema_fingerprint()}_graphs.pkl"
 
-    return {
-        "num_nodes":        G.number_of_nodes(),
-        "num_edges":        G.number_of_edges(),
-        "total_recognitions": sum(d["weight"] for _, _, d in G.edges(data=True)),
-        "top_relationship": f"{edges[0][0]} → {edges[0][1]}" if edges else "N/A",
-        "top_relationship_count": edges[0][2]["weight"] if edges else 0,
-        "most_central":     max(centrality, key=centrality.get) if centrality else "N/A",
-        "all_edges":        [(s, t, d["weight"], d["top_category"]) for s, t, d in edges],
-        "centrality":       dict(sorted(centrality.items(), key=lambda x: x[1], reverse=True)),
-    }
+    if cache.exists() and cache.stat().st_mtime >= source.stat().st_mtime:
+        with open(cache, "rb") as f:
+            _graphs = pickle.load(f)
+    else:
+        _graphs = _build()
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        with open(cache, "wb") as f:
+            pickle.dump(_graphs, f)
+    return _graphs
+
+
+def _dept_graph() -> nx.DiGraph:
+    return _load_graphs()["department"]
+
+
+def _role_graph() -> nx.DiGraph:
+    return _load_graphs()["role"]
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Structured queries (ready for structured tool calling later)
 # ---------------------------------------------------------------------------
+
+def top_relationships(n: int = 10, cross_department_only: bool = False) -> list[dict]:
+    edges = [
+        {"from": s, "to": t, "count": d["weight"], "top_category": d["top_category"]}
+        for s, t, d in _dept_graph().edges(data=True)
+        if not (cross_department_only and s == t)
+    ]
+    return sorted(edges, key=lambda e: e["count"], reverse=True)[:n]
+
+
+def department_volumes(direction: str = "given") -> list[tuple[str, int]]:
+    G = _dept_graph()
+    deg = G.out_degree(weight="weight") if direction == "given" else G.in_degree(weight="weight")
+    return sorted(deg, key=lambda x: x[1], reverse=True)
+
+
+def central_departments(n: int = 5) -> list[tuple[str, float]]:
+    """Betweenness centrality. NetworkX treats edge weight as DISTANCE, but our
+    weights are recognition counts (closeness). Convert to distance = 1 / count,
+    so strong connections count as short routes, not long ones."""
+    G = _dept_graph().copy()
+    G.remove_edges_from(nx.selfloop_edges(G))   # within-department loops are not routes
+    for _, _, d in G.edges(data=True):
+        d["distance"] = 1.0 / d["weight"]
+    if G.number_of_nodes() > EXACT_CENTRALITY_MAX_NODES:
+        scores = nx.betweenness_centrality(G, k=CENTRALITY_SAMPLE_K, weight="distance", seed=42)
+    else:
+        scores = nx.betweenness_centrality(G, weight="distance")
+    return sorted(scores.items(), key=lambda x: x[1], reverse=True)[:n]
+
+
+def within_department() -> list[tuple[str, int]]:
+    G = _dept_graph()
+    pairs = [(n, G[n][n]["weight"]) for n in G.nodes() if G.has_edge(n, n)]
+    return sorted(pairs, key=lambda x: x[1], reverse=True)
+
+
+def mutual_pairs(n: int = 10) -> list[dict]:
+    G = _dept_graph()
+    out = []
+    for a, b, d in G.edges(data=True):
+        if a < b and G.has_edge(b, a):
+            back = G[b][a]["weight"]
+            out.append({"a": a, "b": b, "a_to_b": d["weight"], "b_to_a": back,
+                        "total": d["weight"] + back})
+    return sorted(out, key=lambda x: x["total"], reverse=True)[:n]
+
+
+def bridge_roles(n: int = 10) -> list[dict]:
+    """Titles that give recognition into the most distinct departments."""
+    R = _role_graph()
+    rows = []
+    for title in R.nodes():
+        reached = {R.nodes[t].get("department") for t in R.successors(title)}
+        reached.discard(None)
+        if len(reached) > 1:
+            rows.append({
+                "role": title,
+                "department": R.nodes[title].get("department", ""),
+                "departments_reached": len(reached),
+                "total_given": int(R.out_degree(title, weight="weight")),
+            })
+    rows.sort(key=lambda r: (r["departments_reached"], r["total_given"]), reverse=True)
+    return rows[:n]
+
+
+def department_profile(department: str) -> dict:
+    G = _dept_graph()
+    if department not in G:
+        return {}
+    gives = sorted(((t, d["weight"], d["top_category"]) for _, t, d in G.out_edges(department, data=True)),
+                   key=lambda x: x[1], reverse=True)
+    gets = sorted(((s, d["weight"], d["top_category"]) for s, _, d in G.in_edges(department, data=True)),
+                  key=lambda x: x[1], reverse=True)
+    return {"gives_to": gives, "receives_from": gets}
+
+
+def path_between(a: str, b: str) -> list[str] | None:
+    try:
+        return nx.shortest_path(_dept_graph(), a, b)
+    except (nx.NetworkXNoPath, nx.NodeNotFound):
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Department detection, driven by the data and schema.yaml
+# ---------------------------------------------------------------------------
+
+def _department_names(dept: str) -> set[str]:
+    """Ways a department can be named in a question: the full name and each
+    part of a compound name ("IT & Security" -> "security", "Supply Chain &
+    E-Commerce" -> "supply chain", "e-commerce"). Parts under 3 letters are
+    skipped because they collide with ordinary words."""
+    d = dept.lower()
+    parts = {p.strip() for p in re.split(r"\s*[/&]\s*", d)}
+    return {n for n in parts | {d} if len(n) > 2}
+
+
+def _departments_in(query: str) -> list[str]:
+    """Departments named in the query. Only department NAMES count, not the
+    title keywords from schema.yaml: keywords like "network" or "test" are
+    ordinary words in analytics questions ("network overview")."""
+    q = query.lower()
+    default = load_schema().get("default_department", "Other")
+    hits = {}
+    for dept in _dept_graph().nodes():
+        if dept == default:   # "other" appears in normal phrases like "each other"
+            continue
+        positions = [m.start() for n in _department_names(dept)
+                     for m in [re.search(rf"\b{re.escape(n)}", q)] if m]
+        if positions:
+            hits[dept] = min(positions)
+    # Keep the order they appear in the query ("path from A to B")
+    return sorted(hits, key=hits.get)
+
 
 def _extract_n(query: str, default: int = 5) -> int:
-    word_nums = {"one":1,"two":2,"three":3,"four":4,"five":5,"six":6,"seven":7,"eight":8,"nine":9,"ten":10}
     match = re.search(r"top\s+(\d+)", query)
     if match:
         return int(match.group(1))
-    for word, num in word_nums.items():
-        if word in query:
-            return num
+    words = {"three": 3, "five": 5, "ten": 10}
+    for w, n in words.items():
+        if re.search(rf"\btop {w}\b", query):
+            return n
     return default
 
 
-def _detect_group(query: str) -> str | None:
-    """Check if query mentions a known role group."""
-    groups = [
-        "Leadership", "Engineering", "Design / Creative", "Customer Service",
-        "Finance / Admin", "People / HR", "Marketing",
-        "Product / Program", "Data / Analytics", "Sales / BD", "Other"
-    ]
-    q = query.lower()
-    for group in groups:
-        if group.lower() in q or group.lower().split(" /")[0] in q:
-            return group
-    # Common aliases
-    aliases = {
-        "engineer": "Engineering", "designer": "Design / Creative",
-        "leader": "Leadership", "executive": "Leadership",
-        "hr": "People / HR", "finance": "Finance / Admin",
-        "marketing": "Marketing", "sales": "Sales / BD",
-        "data": "Data / Analytics", "product": "Product / Program",
-        "customer": "Customer Service",
+# ---------------------------------------------------------------------------
+# Keyword interface (used by router.py and agent_graph.py)
+# ---------------------------------------------------------------------------
+
+def _has(q: str, words: list[str]) -> bool:
+    return any(w in q for w in words)
+
+
+def graph_query(query: str) -> str:
+    """Decide the question's intent first, then answer only that.
+    Generic tables appear only when no specific intent matches."""
+    # "give me ..." is a request, not about giving recognition
+    q = re.sub(r"\bgive me\b", "show me", query.lower())
+    depts = _departments_in(q)
+
+    intents = {
+        "path":    len(depts) >= 2 and _has(q, ["path", "route", "chain", "reach"]),
+        "bridge":  _has(q, ["bridge", "span", "multiple departments", "across departments"]),
+        "mutual":  _has(q, ["mutual", "bidirectional", "both ways", "reciprocal"]),
+        "central": _has(q, ["central", "influential", "hub", "key player", "important"]),
+        "within":  _has(q, ["within", "internal", "same department", "self-recogni"]),
+        "givers":  _has(q, ["give", "gave", "giver", "nominat", "who recogni"]) and not depts,
+        "receivers": _has(q, ["receive", "received", "receiver", "most awarded"]) and not depts,
+        # "Cross" only when no department is named; "how does X connect to
+        # other departments" is a question about X, answered by its profile
+        "cross":   _has(q, ["cross"]) or (_has(q, ["other department", "different department"]) and not depts),
     }
-    for alias, group in aliases.items():
-        if alias in q:
-            return group
-    return None
+    intents["profile"] = bool(depts) and not intents["path"]
+    # "each other" with no department named means mutual + strongest flows
+    if "each other" in q and not depts:
+        intents["mutual"] = True
+    specific = any(intents.values())
+    intents["strongest"] = (not specific and _has(q, ["most", "top", "highest", "strongest", "flow", "between"])) \
+        or ("each other" in q and not depts) or _has(q, ["strongest"])
+
+    out: list[str] = []
+    n = _extract_n(q, default=10)
+
+    if intents["path"]:
+        path = path_between(depts[0], depts[1])
+        out.append(f"=== Recognition Path: {depts[0]} -> {depts[1]} ===\n")
+        out.append(f"  {' -> '.join(path)}" if path else "  No path found")
+        out.append("")
+
+    if intents["bridge"]:
+        out.append(f"=== Top {n} Bridge Roles (recognize across the most departments) ===\n")
+        for r in bridge_roles(n):
+            out.append(f"  {r['role']} ({r['department']}): reaches {r['departments_reached']} "
+                       f"departments, {r['total_given']} recognitions given")
+        out.append("")
+
+    if intents["mutual"]:
+        out.append("=== Mutual Recognition Pairs (both directions) ===\n")
+        for p in mutual_pairs(10):
+            out.append(f"  {p['a']} <-> {p['b']}: {p['total']} total ({p['a_to_b']} + {p['b_to_a']})")
+        out.append("")
+
+    if intents["cross"] or intents["strongest"]:
+        cross = intents["cross"]
+        title = "Cross-Department Relationships" if cross else "Strongest Recognition Relationships"
+        out.append(f"=== Top {n} {title} ===\n")
+        for e in top_relationships(n, cross_department_only=cross):
+            out.append(f"  {e['from']} -> {e['to']}: {e['count']} recognitions (mainly: {e['top_category']})")
+        out.append("")
+
+    if intents["givers"]:
+        k = _extract_n(q)
+        out.append(f"=== Top {k} Departments by Recognition Given ===\n")
+        out += [f"  {d}: {total} given" for d, total in department_volumes("given")[:k]]
+        out.append("")
+
+    if intents["receivers"]:
+        k = _extract_n(q)
+        out.append(f"=== Top {k} Departments by Recognition Received ===\n")
+        out += [f"  {d}: {total} received" for d, total in department_volumes("received")[:k]]
+        out.append("")
+
+    if intents["central"]:
+        out.append("=== Most Central Departments (betweenness centrality) ===\n")
+        out += [f"  {d}: {score:.3f}" for d, score in central_departments(5)]
+        out.append("")
+
+    if intents["within"]:
+        out.append("=== Within-Department Recognition ===\n")
+        out += [f"  {d} -> {d}: {w}" for d, w in within_department()]
+        out.append("")
+
+    if intents["profile"]:
+        for d in depts[:2]:
+            prof = department_profile(d)
+            if not prof:
+                continue
+            out.append(f"=== Recognition Network for '{d}' ===\n")
+            out.append("  Recognizes:")
+            out += [f"    -> {t}: {w} (mainly: {c})" for t, w, c in prof["gives_to"][:5]]
+            out.append("  Recognized by:")
+            out += [f"    <- {s_}: {w} (mainly: {c})" for s_, w, c in prof["receives_from"][:5]]
+            out.append("")
+
+    if not out:
+        G = _dept_graph()
+        out.append("=== Recognition Network Overview ===\n")
+        out.append(f"  Departments: {G.number_of_nodes()}")
+        out.append(f"  Department relationships: {G.number_of_edges()}")
+        out.append(f"  Job titles: {_role_graph().number_of_nodes()}")
+        out.append(f"  Total recognitions: {int(G.size(weight='weight'))}")
+        out.append("\n  Top 5 relationships:")
+        out += [f"    {e['from']} -> {e['to']}: {e['count']}" for e in top_relationships(5)]
+
+    return "\n".join(out)
 
 
-# ---------------------------------------------------------------------------
-# Quick test
-# ---------------------------------------------------------------------------
+def get_graph_stats() -> dict:
+    """Summary stats for dashboards (same keys as the previous version)."""
+    G = _dept_graph()
+    edges = top_relationships(n=G.number_of_edges())
+    central = dict(central_departments(n=G.number_of_nodes()))
+    return {
+        "num_nodes": G.number_of_nodes(),
+        "num_edges": G.number_of_edges(),
+        "total_recognitions": int(G.size(weight="weight")),
+        "top_relationship": f"{edges[0]['from']} → {edges[0]['to']}" if edges else "N/A",
+        "top_relationship_count": edges[0]["count"] if edges else 0,
+        "most_central": max(central, key=central.get) if central else "N/A",
+        "all_edges": [(e["from"], e["to"], e["count"], e["top_category"]) for e in edges],
+        "centrality": central,
+    }
+
 
 if __name__ == "__main__":
-    print("Building recognition graph...")
-    stats = get_graph_stats()
-    print(f"\nGraph built:")
-    print(f"  Nodes: {stats['num_nodes']} role groups")
-    print(f"  Edges: {stats['num_edges']} relationships")
-    print(f"  Total recognitions: {stats['total_recognitions']}")
-    print(f"  Strongest relationship: {stats['top_relationship']} ({stats['top_relationship_count']} times)")
-    print(f"  Most central group: {stats['most_central']}")
-
-    print("\n" + "="*60)
-    print("Test 1: Which departments recognize each other most?")
-    print("="*60)
-    print(graph_query("which departments recognize each other most?"))
-
-    print("="*60)
-    print("Test 2: How connected is Leadership?")
-    print("="*60)
-    print(graph_query("how does leadership recognize others?"))
-
-    print("="*60)
-    print("Test 3: Network overview")
-    print("="*60)
-    print(graph_query("give me a network overview"))
+    tests = [
+        "Which departments recognize each other most?",
+        "Show me mutual recognition pairs",
+        "Who are the most central hubs?",
+        "Show me cross-department recognition only",
+        "How does Engineering connect to the network?",
+        "Who are the bridge roles that span multiple departments?",
+        "What is the path between Leadership and Engineering?",
+        "Give me a network overview",
+        "How does Leadership connect to other departments?",
+        "Who gives the most recognition?",
+    ]
+    for t in tests:
+        print("=" * 60)
+        print(f"Q: {t}")
+        print("-" * 60)
+        print(graph_query(t))

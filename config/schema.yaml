@@ -1,0 +1,59 @@
+# =============================================================================
+# Dataset schema mapping
+# =============================================================================
+# Maps a company's recognition dataset onto the standard schema every tool
+# uses. To onboard a new dataset: copy this file, change the dataset path and
+# the right-hand column names, then point SCHEMA_PATH at your copy (in .env).
+# Nothing else in the code should need to change.
+# =============================================================================
+
+dataset:
+  name: workhuman_capstone
+  path: output/reports/annotated_results.csv
+
+# standard_name: column name in your CSV (use null if your data lacks it)
+columns:
+  message:             message
+  award:               award_title
+  giver_title:         nominator_title
+  receiver_title:      recipient_title
+  giver_department:    null      # not in this dataset; derived from titles below
+  receiver_department: null
+  date:                null      # add a date column to unlock trend questions
+  category:            category_name
+  subcategory:         subcategory_name
+
+# Only used when the dataset has no department columns.
+# Departments are FUNCTIONS, not seniority levels: "Director, Sales" is Sales.
+# Leadership only catches executive titles that name no function.
+# Each department lists keywords to look for in job titles.
+# Checked top to bottom, first match wins, so order matters.
+# Keywords of 3 letters or fewer ("ui", "hr", "vp") must match a whole word.
+# Longer keywords match at the start of a word ("analy" -> "Analyst").
+department_rules:
+  Legal:                     ["legal", "counsel", "contracts"]
+  IT & Security:             ["it", "helpdesk", "end user", "security", "network"]
+  Customer Service:          ["customer service", "customer success", "customer experience", "customer advocacy", "knowledge management"]
+  Engineering:               ["engineer", "software", "developer", "qa", "technical", "devops", "architect", "infrastructure", "release", "test"]
+  People / HR:               ["hr", "hx", "hris", "people", "talent", "recruit", "human experience", "workplace experience", "benefits", "total rewards", "compensation", "learning and development", "inclusion"]
+  Finance / Admin:           ["accounts payable", "accounts receivable", "accountant", "accounting", "finance", "financial", "payroll", "buyer", "procurement", "billing", "collections", "ar", "fp&a", "controller", "tax", "internal control", "executive assistant"]
+  Sales / BD:                ["sales", "business develop", "revenue", "gtm", "enablement", "partner account", "partner manag"]
+  Marketing:                 ["market", "brand", "media", "pr", "communications", "event", "speaker", "campaign", "demand generation", "digital"]
+  Design / Creative:         ["design", "creative", "ux", "ui", "copywrit", "content", "artist", "art director", "video", "multimedia", "presentation", "graphic"]
+  Product / Program:         ["product", "program", "project"]
+  Data / Analytics:          ["data", "analy", "insight", "research", "linguist", "whiq", "nlp", "bi"]
+  Supply Chain & E-Commerce: ["supply chain", "sourcing", "demand plan", "category manag", "supplier", "vendor", "order management", "merchandis", "e-commerce", "ecommerce", "store", "gift card"]
+  Professional Services:     ["consult", "launch success", "practice lead", "client", "customer strategy"]
+  Leadership:                ["chief", "president", "vp", "svp", "evp", "head of", "gm", "general manager", "director"]
+
+# Exact job titles that the rules get wrong. These win over the rules.
+# Run `python -m src.rag.schema` to see what lands in the default bucket.
+department_overrides:
+  "Senior Payment Services and Security Specialist": Finance / Admin
+  "Campaign Developer Manager": Marketing
+  "Chief Technology Officer": Engineering
+  "Senior Director, Technology": Engineering
+  "Director, Back Office Solutions": Engineering
+  "Senior Director, Back Office Solutions": Engineering
+
+default_department: Other
