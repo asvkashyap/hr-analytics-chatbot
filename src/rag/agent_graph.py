@@ -1,11 +1,15 @@
 """
-src/rag/agent_graph.py - LangGraph tool-calling agent (experimental)
-====================================================================
-Same tools, data, and system prompt as agent.py. The difference: the LLM
-decides which tools to call (and in what order) instead of the rule-based
-QueryRouter. Built so the two approaches can be compared side by side.
+src/rag/agent_graph.py - LangGraph tool-calling agent
+=====================================================
+The LLM decides which tools to call (and in what order). Guardrails run as
+graph nodes: input guard, tool-result guard (injection scan and PII
+redaction), and output guard (PII backstop and number grounding).
 
-Run the side-by-side test:
+This replaced the original rule-based router agent (agent.py and router.py),
+which was retired once the comparison favored LLM tool selection. Both remain
+in Git history.
+
+Run a few test questions:
     python -m src.rag.agent_graph
 
 Requires:
@@ -18,7 +22,7 @@ import time
 from pathlib import Path
 from dotenv import load_dotenv
 
-# Load .env from project root (same as agent.py)
+# Load .env from project root
 _project_root = Path(__file__).resolve().parents[2]
 load_dotenv(_project_root / ".env")
 
@@ -31,10 +35,8 @@ from langgraph.prebuilt import ToolNode, tools_condition
 from langgraph.checkpoint.memory import InMemorySaver
 
 # Reuse the existing tools and checks, unchanged
-from src.rag.tools import vector_search, pandas_analytics, substitution
+from src.rag.tools import vector_search, pandas_analytics, substitution, CRAGChecker
 from src.rag.graph_tool import graph_query
-from src.rag.router import CRAGChecker, QueryRouter
-from src.rag.agent import SYSTEM_PROMPT
 from src.rag.schema import describe_dataset
 from src.utils.llm_usage import (
     RateLimiter, record_usage, extract_usage, cost_usd,
@@ -59,12 +61,28 @@ RECURSION_LIMIT = 25     # caps graph steps per question (agent, tools, guard, r
 
 _crag = CRAGChecker()
 
+SYSTEM_PROMPT = f"""You are an expert HR analytics assistant for a recognition intelligence platform.
+
+You have access to recognition data with:
+{describe_dataset()}
+- A recognition network graph connecting departments and job titles
+
+Your job is to answer questions clearly and insightfully using the context provided.
+
+Guidelines:
+- Be concise but thorough
+- Use specific numbers and percentages when available
+- Highlight patterns and insights, not just raw data
+- For graph/network questions, explain what the relationships mean organizationally
+- If context is insufficient, say so honestly
+- Format responses clearly with headers when answering complex questions
+"""
+
 
 # ---------------------------------------------------------------------------
 # Tools
-# The docstrings ARE the routing logic now. The LLM reads each tool's name
-# and description to decide what to call. They are written from the signal
-# banks in router.py.
+# The docstrings ARE the routing logic. The LLM reads each tool's name
+# and description to decide what to call.
 # ---------------------------------------------------------------------------
 
 @tool
@@ -74,7 +92,7 @@ def search_recognition_messages(question: str) -> str:
     what kind of messages people write, or 'tell me about' questions.
     Returns the most similar recognition records with category and role."""
     result = vector_search(question)
-    # CRAG check from router.py, surfaced to the agent instead of hardcoded
+    # Retrieval check, surfaced to the agent so it decides what to do
     check = _crag.check(question, result)
     if check["action"] != "proceed":
         result += (
@@ -126,15 +144,6 @@ TOOLS = [
     recognition_network,
 ]
 
-# Maps router.py tool names to agent tool names, for the comparison
-ROUTER_TO_AGENT = {
-    "vector_search":    "search_recognition_messages",
-    "pandas_analytics": "recognition_statistics",
-    "substitution":     "find_similar_roles",
-    "graph_query":      "recognition_network",
-    "neo4j_query":      "recognition_network",
-}
-
 TOOL_GUIDANCE = """
 How to use your tools:
 - You have four tools over the recognition data. Decide which ones the question needs.
@@ -160,6 +169,9 @@ _llm = ChatGroq(
     model=GROQ_MODEL,
     temperature=TEMPERATURE,
     max_tokens=MAX_TOKENS,
+    # agent_node's loop is the only retry layer, so every wait is counted.
+    # The client's own default (2 retries) would multiply calls and hide waits.
+    max_retries=0,
 ).bind_tools(TOOLS)
 
 
@@ -421,7 +433,7 @@ def build_graph(tools: list | None = None):
     g.add_edge("tool_result_guard", "agent")
     # Guard passes or warns -> end; guard asks for a revision -> back to the agent
     g.add_conditional_edges("output_guard", route_after_guard, {"agent": "agent", END: END})
-    # Checkpointer = session memory, keyed by thread_id (replaces _sessions dict)
+    # Checkpointer = session memory, keyed by thread_id
     return g.compile(checkpointer=InMemorySaver())
 
 
@@ -538,7 +550,7 @@ def _format_timings(raw: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Side-by-side test: rule-based router vs LLM agent
+# Quick manual test
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
@@ -551,12 +563,11 @@ if __name__ == "__main__":
         "Who could replace a Senior Director?",
         "Which departments recognize each other most?",
         "Who are the bridge roles that span multiple departments?",
-        # Multi-step: the rule-based router cannot sequence these
         "Who could replace a Senior Director, and how does Leadership connect to other departments?",
         "Which category is least recognized, and show me example messages from it",
     ]
 
-    parser = argparse.ArgumentParser(description="Router vs LangGraph agent test")
+    parser = argparse.ArgumentParser(description="LangGraph agent quick test")
     parser.add_argument("--only", type=int, nargs="+", help="run only these question numbers (see --list)")
     parser.add_argument("--q", help="run one custom question instead of the test set")
     parser.add_argument("--list", action="store_true", help="list the test questions and exit")
@@ -573,30 +584,17 @@ if __name__ == "__main__":
     else:
         selected = list(enumerate(test_questions))
 
-    router = QueryRouter()
-
     print("=" * 60)
-    print("  Router vs LangGraph Agent")
-    print(f"  Model: {GROQ_MODEL} (temperature {TEMPERATURE})")
+    print(f"  LangGraph Agent | Model: {GROQ_MODEL} (temperature {TEMPERATURE})")
     print("=" * 60)
 
-    # No fixed pause needed: the rate limiter waits only when the budget is full
     for i, q in selected:
-        decision = router.route(q)
-        router_tools = sorted({ROUTER_TO_AGENT.get(t, t) for t in decision.tools})
-
         # Fresh session per question so answers don't leak into each other
         result = chat_agent(q, session_id=f"test-{i}")
-
-        if result.get("error"):
-            match = "ERROR"
-        else:
-            match = "MATCH" if router_tools == result["tools_used"] else "DIFFERENT"
         print(f"\n{'=' * 60}")
         print(f"Q: {q}")
         print("-" * 60)
-        print(f"Router: {decision.route.value.upper()} -> {router_tools or ['none']}")
-        print(f"Agent:  {result['tools_used'] or ['none']}   [{match}]   "
+        print(f"Tools: {result['tools_used'] or ['none']}   "
               f"Input: {result.get('input_label', '')}   Guard: {result.get('guard', '')}")
         print(f"Processing: {result.get('processing_s', result['latency_s'])}s "
               f"(+{result.get('wait_s', 0)}s waiting) | Tokens: {result['tokens']} | "

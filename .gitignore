@@ -20,6 +20,8 @@ dist/
 
 # Rebuilt automatically from the data and config/schema.yaml
 output/graphs/
+# Raw evaluation runs (large; summaries get committed separately)
+output/eval/
 # Personal editor settings and test caches
 *.code-workspace
 .pytest_cache/

@@ -33,6 +33,36 @@ COLLECTION_NAME = "recognition_records"
 EMBED_MODEL     = "all-MiniLM-L6-v2"
 TOP_K           = 5
 
+
+# ---------------------------------------------------------------------------
+# Retrieval check (moved from router.py when the router was retired)
+# Keyword overlap between the question and the search results. The agent
+# reads the warning and decides what to do. Planned to be replaced by a
+# cross-encoder reranker score.
+# ---------------------------------------------------------------------------
+
+class CRAGChecker:
+    def __init__(self, threshold: float = 0.25):
+        self.threshold = threshold
+
+    def check(self, query: str, retrieved_text: str) -> dict:
+        score = self._overlap_score(query, retrieved_text)
+        if score >= self.threshold:
+            return {"score": score, "passed": True,  "action": "proceed"}
+        elif score >= self.threshold * 0.5:
+            return {"score": score, "passed": False, "action": "rerank"}
+        else:
+            return {"score": score, "passed": False, "action": "fallback"}
+
+    def _overlap_score(self, query: str, text: str) -> float:
+        if not text:
+            return 0.0
+        q_words = set(re.findall(r"\b\w{3,}\b", query.lower()))
+        t_words = set(re.findall(r"\b\w{3,}\b", text.lower()))
+        if not q_words:
+            return 0.0
+        return len(q_words & t_words) / len(q_words)
+
 # ---------------------------------------------------------------------------
 # Singletons — loaded once, reused across all tool calls
 # ---------------------------------------------------------------------------

@@ -3,7 +3,7 @@ Recognition Analytics API
 ==========================
 FastAPI backend that serves:
   GET  /api/stats      — aggregated stats computed from annotated_results.csv
-  POST /api/chat       — routes to existing src/rag/agent.py
+  POST /api/chat       — routes to the LangGraph agent (src/rag/agent_graph.py)
   POST /api/clear      — clears agent session memory
   POST /api/visualize  — Groq-powered dynamic chart generator
 
@@ -36,14 +36,10 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ── Import the agent ────────────────────────────────────────────────────────────────
-# AGENT_BACKEND in .env: "graph" (LangGraph + guardrails, default) or
-# "router" (the original rule-based agent, kept for comparison)
-AGENT_BACKEND = os.getenv("AGENT_BACKEND", "graph").lower()
+# LangGraph agent with guardrails (the rule-based router agent was retired)
+AGENT_BACKEND = "graph"
 try:
-    if AGENT_BACKEND == "router":
-        from src.rag.agent import chat as agent_chat, clear_session
-    else:
-        from src.rag.agent_graph import chat_agent as agent_chat, clear_session
+    from src.rag.agent_graph import chat_agent as agent_chat, clear_session
     AGENT_AVAILABLE = True
 except Exception as e:
     AGENT_AVAILABLE = False
@@ -60,8 +56,6 @@ _TOOL_ROUTES = {
 
 
 def _route_for(result: dict) -> str:
-    if result.get("route"):                 # router backend reports its own route
-        return result["route"]
     if result.get("guard") == "refused":     # blocked by the input guard
         return "guarded"
     tools = result.get("tools_used", [])
